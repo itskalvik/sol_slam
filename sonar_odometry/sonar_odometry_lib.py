@@ -8,9 +8,11 @@ import torch.nn.functional as F
 import torch._dynamo
 import torchvision
 
-from sensor_msgs.msg import Image
+from std_msgs.msg import Header
+from sensor_msgs.msg import Image, PointCloud2
+import sensor_msgs_py.point_cloud2 as pc2
 from nav_msgs.msg import Odometry, Path
-from geometry_msgs.msg import TransformStamped, Quaternion, PoseStamped
+from geometry_msgs.msg import TransformStamped, Quaternion, PoseStamped, Point
 from tf2_ros import TransformBroadcaster
 from rcl_interfaces.msg import SetParametersResult
 from std_srvs.srv import Trigger
@@ -205,6 +207,7 @@ class SonarStateEstimator:
             self.local_map = torch.zeros((self.map_size, self.map_size), dtype=self.dtype, device=self.device)
             self.local_map_blurred = torch.zeros_like(self.local_map)
             self.last_cart_scan = None
+            self.last_polar_scan = None # Added to extract peaks natively
             
             axis = (torch.arange(self.map_size, dtype=self.dtype, device=self.device) - self.map_size // 2) * self.map_res
             grid_y, grid_x = torch.meshgrid(axis, axis, indexing='ij')
@@ -386,6 +389,7 @@ class SonarStateEstimator:
 
             self.step_counter += 1
             self.last_cart_scan = base_cart_scan
+            self.last_polar_scan = clean_scan # Store to make peak extraction highly efficient
 
 
 # ==========================================
@@ -404,15 +408,16 @@ class BaseSonarOdometryNode(Node):
         # Visual Debug Parameters
         self.declare_parameter('scan_img_topic', '/sonar_scan_img')
         self.declare_parameter('map_img_topic', '/sonar_map_img')
+        self.declare_parameter('peaks_topic', '/sonar_peaks')
         self.declare_parameter('contrast', 10.0)
 
         # Core Parameters (Matching ROS 1 Method)
         self.declare_parameter('mapping.update_alpha', 0.3)
         self.declare_parameter('mapping.is_warped', False)
-        self.declare_parameter('mapping.noise_decay_factor', 2.0)
-        self.declare_parameter('mapping.denoise_factor', 2.0)
+        self.declare_parameter('mapping.noise_decay_factor', 3.0)
+        self.declare_parameter('mapping.denoise_factor', 3.0)
         self.declare_parameter('mapping.min_intensity_threshold', 0.0008)
-        self.declare_parameter('mapping.min_valid_fraction', 0.01)
+        self.declare_parameter('mapping.min_valid_fraction', 0.006)
 
         self.declare_parameter('solver.iterations', 15)
         self.declare_parameter('solver.lr', 1.0)
@@ -429,6 +434,7 @@ class BaseSonarOdometryNode(Node):
         self.tf_broadcaster = TransformBroadcaster(self)
         self.odom_pub = self.create_publisher(Odometry, self.get_parameter('topic_out').value, 10)
         self.path_pub = self.create_publisher(Path, self.get_parameter('path_topic').value, 10)
+        self.peaks_pub = self.create_publisher(PointCloud2, self.get_parameter('peaks_topic').value, 10)
 
         # Vision Debug Publishers
         self.scan_img_pub = self.create_publisher(Image, self.get_parameter('scan_img_topic').value, 10)
@@ -487,7 +493,7 @@ class BaseSonarOdometryNode(Node):
                 'denoise_factor': self.get_parameter('mapping.denoise_factor').value,
                 'min_intensity_threshold': self.get_parameter('mapping.min_intensity_threshold').value,
                 'min_valid_fraction': self.get_parameter('mapping.min_valid_fraction').value,
-                'blur_kernel_size': [5, 1], 'blur_sigma': 1.0
+                'blur_kernel_size': [1, 1], 'blur_sigma': 0.0
             },
             'solver': {
                 'iterations': self.get_parameter('solver.iterations').value, 
@@ -538,6 +544,57 @@ class BaseSonarOdometryNode(Node):
 
         self.publish_odometry(stamp, pos_x, pos_y, rot_theta, vx, vy, vth)
         self.publish_debug_images(stamp)
+        self.publish_peaks(stamp)
+
+    def publish_peaks(self, stamp):
+        """Extracts the maximum intensity range per beam angle and publishes it as a PointCloud2."""
+        if getattr(self.estimator, 'last_polar_scan', None) is None:
+            return
+
+        try:
+            # We use the polar matrix (W beams, H ranges) directly as it computes peaks flawlessly
+            # without Cartesian grid blurring artifacts, giving the exact equivalent of last_cart_scan peaks
+            scan = self.estimator.last_polar_scan
+            
+            # Find the max intensity and its distance index for each angle beam
+            max_vals, max_indices = scan.max(dim=0)
+            
+            max_vals = max_vals.cpu().numpy()
+            max_indices = max_indices.cpu().numpy()
+            angles = self.estimator.beam_angles.cpu().numpy()
+            
+            H, W = scan.shape
+            max_range = self.current_range
+            threshold = self.get_parameter('mapping.min_intensity_threshold').value
+            
+            points = []
+            
+            for i in range(W):
+                if max_vals[i] > threshold:
+                    # Convert range index to physical distance
+                    r = (max_indices[i] / float(H - 1)) * max_range
+                    theta = angles[i]
+                    
+                    # Convert to cartesian coordinates local to the sonar base frame
+                    # standard ROS coordinates: x forward, y left
+                    x = float(r * math.cos(theta))
+                    y = float(r * math.sin(theta))
+                    z = 0.0
+                    
+                    points.append([x, y, z])
+                    
+            if points:
+                header = Header()
+                if stamp: 
+                    header.stamp = stamp
+                header.frame_id = self.child_frame_id
+                
+                # pc2 handles the exact byte formatting needed for the pointcloud
+                cloud_msg = pc2.create_cloud_xyz32(header, points)
+                self.peaks_pub.publish(cloud_msg)
+
+        except Exception as e:
+            self.get_logger().error(f"Failed to publish sonar peaks point cloud: {e}")
 
     def publish_debug_images(self, stamp):
         """Publishes Viridis-colored OpenCV images for map debugging."""
