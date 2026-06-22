@@ -5,9 +5,10 @@ from rclpy.qos import qos_profile_sensor_data
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
 import torch
+import numpy as np
 
-# Import our custom Base Class (adjust import path based on your package structure)
-from .sonar_odometry_lib import BaseSonarOdometryNode
+# Import our custom Base Class, device utilities, and unwarping helper
+from .sonar_odometry_lib import BaseSonarOdometryNode, unwarp_sonar, get_best_device
 
 class SonoptixOdometryNode(BaseSonarOdometryNode):
     """
@@ -17,13 +18,13 @@ class SonoptixOdometryNode(BaseSonarOdometryNode):
     def __init__(self):
         super().__init__('sonoptix_odometry')
 
-        # Sonoptix-specific parameters
         self.declare_parameter('topic_in', '/sonar/echo/data')
+        self.declare_parameter('unwarp_image', False)
+        
         topic_in = self.get_parameter('topic_in').value
+        self.needs_unwarp = self.get_parameter('unwarp_image').value
 
         self.br = CvBridge()
-        
-        # Subscribe to the Sonoptix image topic
         self.sub = self.create_subscription(
             Image, 
             topic_in, 
@@ -34,24 +35,25 @@ class SonoptixOdometryNode(BaseSonarOdometryNode):
         self.get_logger().info('Sonoptix Odometry Subscriber Initialized.')
 
     def image_callback(self, msg):
-        # 1. Parse hardware-specific message into an OpenCV array
         cv_img = self.br.imgmsg_to_cv2(msg, desired_encoding='mono8')
         h, w = cv_img.shape
 
-        # 2. Extract embedded meta-data (Sonoptix stores range in pixel [0,0])
-        max_range_m = 12 #float(cv_img[0, 0])
+        # Sonoptix generic meta-data rule
+        max_range_m = 12 
         fov = 120 if max_range_m <= 30 else 90
 
-        # 3. Clean the artifact pixel to avoid interfering with gradient calculations
+        # Clean the artifact pixel
         cv_img[0, 0] = 0
+        
+        # Apply the Unwarp method if the image is a fan/wedge 
+        if self.needs_unwarp:
+            cv_img = unwarp_sonar(cv_img, fov=fov, num_beams=768)
+            h, w = cv_img.shape # Update to the new polar dimensions
 
-        # 4. Convert to PyTorch tensor
-        # We ensure the tensor lives on the correct device by asking the base class estimator 
-        # (Defaulting to CPU if the estimator hasn't fully initialized yet)
-        device = self.estimator.device if self.estimator else torch.device('cpu')
-        scan_tensor = torch.tensor(cv_img, dtype=torch.float32, device=device)
+        # Force layout to the highest performance device available before dropping into base class
+        device = self.estimator.device if self.estimator else get_best_device()
+        scan_tensor = torch.as_tensor(cv_img, dtype=torch.float32, device=device)
 
-        # 5. Hand the standardized data to the Base Class for Odometry Optimization
         self.process_sonar_scan(
             scan_tensor=scan_tensor,
             max_range_m=max_range_m,
