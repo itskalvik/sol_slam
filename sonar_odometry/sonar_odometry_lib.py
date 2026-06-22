@@ -555,6 +555,8 @@ class BaseSonarOdometryNode(Node):
             # We use the polar matrix (W beams, H ranges) directly as it computes peaks flawlessly
             # without Cartesian grid blurring artifacts, giving the exact equivalent of last_cart_scan peaks
             scan = self.estimator.last_polar_scan
+            # flip horizontally
+            scan = torch.flip(scan, dims=[1])
             
             # Find the max intensity and its distance index for each angle beam
             max_vals, max_indices = scan.max(dim=0)
