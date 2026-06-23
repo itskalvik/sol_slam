@@ -9,7 +9,7 @@ import torch._dynamo
 import torchvision
 
 from std_msgs.msg import Header
-from sensor_msgs.msg import Image, PointCloud2
+from sensor_msgs.msg import Image, PointCloud2, PointField
 import sensor_msgs_py.point_cloud2 as pc2
 from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import TransformStamped, Quaternion, PoseStamped, Point
@@ -207,7 +207,6 @@ class SonarStateEstimator:
             self.local_map = torch.zeros((self.map_size, self.map_size), dtype=self.dtype, device=self.device)
             self.local_map_blurred = torch.zeros_like(self.local_map)
             self.last_cart_scan = None
-            self.last_polar_scan = None # Added to extract peaks natively
             
             axis = (torch.arange(self.map_size, dtype=self.dtype, device=self.device) - self.map_size // 2) * self.map_res
             grid_y, grid_x = torch.meshgrid(axis, axis, indexing='ij')
@@ -389,7 +388,6 @@ class SonarStateEstimator:
 
             self.step_counter += 1
             self.last_cart_scan = base_cart_scan
-            self.last_polar_scan = clean_scan # Store to make peak extraction highly efficient
 
 
 # ==========================================
@@ -415,7 +413,7 @@ class BaseSonarOdometryNode(Node):
         self.declare_parameter('mapping.update_alpha', 0.3)
         self.declare_parameter('mapping.is_warped', False)
         self.declare_parameter('mapping.noise_decay_factor', 3.0)
-        self.declare_parameter('mapping.denoise_factor', 3.0)
+        self.declare_parameter('mapping.denoise_factor', 2.5)
         self.declare_parameter('mapping.min_intensity_threshold', 0.0008)
         self.declare_parameter('mapping.min_valid_fraction', 0.006)
 
@@ -547,43 +545,40 @@ class BaseSonarOdometryNode(Node):
         self.publish_peaks(stamp)
 
     def publish_peaks(self, stamp):
-        """Extracts the maximum intensity range per beam angle and publishes it as a PointCloud2."""
-        if getattr(self.estimator, 'last_polar_scan', None) is None:
+        """Extracts valid points from the continuous local map and publishes them as a PointCloud2."""
+        if not hasattr(self.estimator, 'local_map') or self.estimator.local_map is None:
             return
 
         try:
-            # We use the polar matrix (W beams, H ranges) directly as it computes peaks flawlessly
-            # without Cartesian grid blurring artifacts, giving the exact equivalent of last_cart_scan peaks
-            scan = self.estimator.last_polar_scan
-            # flip horizontally
-            scan = torch.flip(scan, dims=[1])
-            
-            # Find the max intensity and its distance index for each angle beam
-            max_vals, max_indices = scan.max(dim=0)
-            
-            max_vals = max_vals.cpu().numpy()
-            max_indices = max_indices.cpu().numpy()
-            angles = self.estimator.beam_angles.cpu().numpy()
-            
-            H, W = scan.shape
-            max_range = self.current_range
+            map_tensor = self.estimator.local_map
             threshold = self.get_parameter('mapping.min_intensity_threshold').value
             
+            mask = map_tensor > threshold
+            if not mask.any():
+                return
+            
+            valid_coords = self.estimator.map_coords[mask].cpu().numpy()
+            valid_intensities = map_tensor[mask].cpu().numpy()
+            
+            # Filter out points within 1 meter (often sonar housing artifact/vehicle body)
+            r2 = valid_coords[:, 0]**2 + valid_coords[:, 1]**2
+            valid_mask = r2 > 1.0
+            
+            valid_coords = valid_coords[valid_mask]
+            valid_intensities = valid_intensities[valid_mask]
+            
+            if len(valid_coords) == 0:
+                return
+
             points = []
             
-            for i in range(W):
-                if max_vals[i] > threshold:
-                    # Convert range index to physical distance
-                    r = (max_indices[i] / float(H - 1)) * max_range
-                    theta = angles[i]
-                    
-                    # Convert to cartesian coordinates local to the sonar base frame
-                    # standard ROS coordinates: x forward, y left
-                    x = float(r * math.cos(theta))
-                    y = float(r * math.sin(theta))
-                    z = 0.0
-                    
-                    points.append([x, y, z])
+            for i in range(len(valid_coords)):
+                x = float(valid_coords[i, 0])
+                y = -float(valid_coords[i, 1])
+                z = 0.0
+                intensity = float(valid_intensities[i])
+                
+                points.append([x, y, z, intensity])
                     
             if points:
                 header = Header()
@@ -591,12 +586,20 @@ class BaseSonarOdometryNode(Node):
                     header.stamp = stamp
                 header.frame_id = self.child_frame_id
                 
+                # Define standard fields
+                fields = [
+                    PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+                    PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+                    PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+                    PointField(name='intensity', offset=12, datatype=PointField.FLOAT32, count=1),
+                ]
+                
                 # pc2 handles the exact byte formatting needed for the pointcloud
-                cloud_msg = pc2.create_cloud_xyz32(header, points)
+                cloud_msg = pc2.create_cloud(header, fields, points)
                 self.peaks_pub.publish(cloud_msg)
 
         except Exception as e:
-            self.get_logger().error(f"Failed to publish sonar peaks point cloud: {e}")
+            self.get_logger().error(f"Failed to publish local map point cloud: {e}")
 
     def publish_debug_images(self, stamp):
         """Publishes Viridis-colored OpenCV images for map debugging."""
