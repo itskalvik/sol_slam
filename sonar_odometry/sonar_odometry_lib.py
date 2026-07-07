@@ -10,7 +10,6 @@ import torchvision
 
 from std_msgs.msg import Header
 from sensor_msgs.msg import Image, PointCloud2, PointField
-import sensor_msgs_py.point_cloud2 as pc2
 from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import TransformStamped, Quaternion, PoseStamped, Point
 from tf2_ros import TransformBroadcaster
@@ -567,36 +566,45 @@ class BaseSonarOdometryNode(Node):
             valid_coords = valid_coords[valid_mask]
             valid_intensities = valid_intensities[valid_mask]
             
-            if len(valid_coords) == 0:
+            num_points = len(valid_coords)
+            if num_points == 0:
                 return
 
-            points = []
-            
-            for i in range(len(valid_coords)):
-                x = float(valid_coords[i, 0])
-                y = -float(valid_coords[i, 1])
-                z = 0.0
-                intensity = float(valid_intensities[i])
-                
-                points.append([x, y, z, intensity])
+            # Vectorized numpy array allocation instead of slow python looping
+            points_np = np.zeros((num_points, 4), dtype=np.float32)
+            points_np[:, 0] = valid_coords[:, 0]
+            points_np[:, 1] = -valid_coords[:, 1]
+            # Z is left at default 0.0 in index 2
+            points_np[:, 3] = valid_intensities
                     
-            if points:
-                header = Header()
-                if stamp: 
-                    header.stamp = stamp
-                header.frame_id = self.child_frame_id
-                
-                # Define standard fields
-                fields = [
-                    PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
-                    PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
-                    PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
-                    PointField(name='intensity', offset=12, datatype=PointField.FLOAT32, count=1),
-                ]
-                
-                # pc2 handles the exact byte formatting needed for the pointcloud
-                cloud_msg = pc2.create_cloud(header, fields, points)
-                self.peaks_pub.publish(cloud_msg)
+            header = Header()
+            if stamp: 
+                header.stamp = stamp
+            header.frame_id = self.child_frame_id
+            
+            # Define standard fields
+            fields = [
+                PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+                PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+                PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+                PointField(name='intensity', offset=12, datatype=PointField.FLOAT32, count=1),
+            ]
+            
+            # Manually structure the PointCloud2 message
+            cloud_msg = PointCloud2()
+            cloud_msg.header = header
+            cloud_msg.height = 1
+            cloud_msg.width = num_points
+            cloud_msg.fields = fields
+            cloud_msg.is_bigendian = False
+            cloud_msg.point_step = 16  # 4 floats * 4 bytes each
+            cloud_msg.row_step = cloud_msg.point_step * num_points
+            cloud_msg.is_dense = True
+            
+            # Dump the numpy float array straight to a byte buffer
+            cloud_msg.data = points_np.tobytes()
+
+            self.peaks_pub.publish(cloud_msg)
 
         except Exception as e:
             self.get_logger().error(f"Failed to publish local map point cloud: {e}")
