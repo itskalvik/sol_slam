@@ -1,12 +1,14 @@
+import os
 import rclpy
 from rclpy.node import Node
 import math
 import numpy as np
 import cv2
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-import torch._dynamo
 import torchvision
+import tensorrt as trt
 
 from std_msgs.msg import Header
 from sensor_msgs.msg import Image, PointCloud2, PointField
@@ -16,8 +18,6 @@ from tf2_ros import TransformBroadcaster
 from rcl_interfaces.msg import SetParametersResult
 from std_srvs.srv import Trigger
 from cv_bridge import CvBridge
-
-torch._dynamo.config.suppress_errors = True
 
 # ==========================================
 # Helper Functions & Device Management
@@ -60,38 +60,49 @@ def unwarp_sonar(warped_image, fov=130, num_beams=768):
 
 
 # ==========================================
-# Optimized Gradient Kernel
+# JIT-Traceable Gradient Kernel
 # ==========================================
-@torch.compile(mode="reduce-overhead")
-def compute_loss_and_grad(state, base_cart_scan, J_flat, M_flat, map_coords, map_res, map_size, flat_mask, N_valid):
-    tx, ty, theta = state[0], state[1], state[2]
-    cos_r, sin_r = torch.cos(theta), torch.sin(theta)
-    
-    x_shifted = map_coords[..., 0] - tx
-    y_shifted = map_coords[..., 1] - ty
-    
-    x_old = x_shifted * cos_r + y_shifted * sin_r
-    y_old = -x_shifted * sin_r + y_shifted * cos_r
-    
-    half_extent = map_res * (map_size - 1) / 2.0
-    norm_x = x_old / half_extent
-    norm_y = y_old / half_extent
-    
-    grid = torch.stack([norm_x, norm_y], dim=-1).unsqueeze(0)
-    
-    warped_scan = F.grid_sample(
-        base_cart_scan.view(1, 1, map_size, map_size), 
-        grid, 
-        align_corners=True, 
-        padding_mode='zeros'
-    ).squeeze()
-    
-    warped_flat = warped_scan.view(-1)[flat_mask]
-    
-    grad = -(J_flat @ warped_flat) / N_valid
-    loss = -torch.dot(M_flat, warped_flat) / N_valid
-    
-    return loss, grad
+class LossAndGradKernel(nn.Module):
+    """
+    Wraps the gradient math into an nn.Module. Constants are now passed dynamically 
+    to prevent the ONNX exporter from forcing static indexers onto the CPU.
+    """
+    def __init__(self, map_res, map_size, N_valid):
+        super().__init__()
+        self.map_res = float(map_res)
+        self.map_size = int(map_size)
+        self.N_valid = float(N_valid)
+
+    def forward(self, state, base_cart_scan, J_flat, M_flat, map_coords, flat_indices):
+        tx, ty, theta = state[0], state[1], state[2]
+        cos_r, sin_r = torch.cos(theta), torch.sin(theta)
+        
+        x_shifted = map_coords[..., 0] - tx
+        y_shifted = map_coords[..., 1] - ty
+        
+        x_old = x_shifted * cos_r + y_shifted * sin_r
+        y_old = -x_shifted * sin_r + y_shifted * cos_r
+        
+        half_extent = self.map_res * (self.map_size - 1) / 2.0
+        norm_x = x_old / half_extent
+        norm_y = y_old / half_extent
+        
+        grid = torch.stack([norm_x, norm_y], dim=-1).unsqueeze(0)
+        
+        warped_scan = F.grid_sample(
+            base_cart_scan.view(1, 1, self.map_size, self.map_size), 
+            grid, 
+            align_corners=True, 
+            padding_mode='zeros'
+        ).squeeze()
+        
+        # Use torch.gather to ensure clean ONNX graph translation
+        warped_flat = torch.gather(warped_scan.view(-1), 0, flat_indices)
+        
+        grad = -(J_flat @ warped_flat) / self.N_valid
+        loss = -torch.dot(M_flat, warped_flat) / self.N_valid
+        
+        return loss, grad
 
 
 # ==========================================
@@ -209,7 +220,7 @@ class SonarStateEstimator:
             
             axis = (torch.arange(self.map_size, dtype=self.dtype, device=self.device) - self.map_size // 2) * self.map_res
             grid_y, grid_x = torch.meshgrid(axis, axis, indexing='ij')
-            self.map_coords = torch.stack([grid_x, grid_y], dim=-1).to(self.device)
+            self.map_coords = torch.stack([grid_x, grid_y], dim=-1).to(self.device).contiguous()
 
             x_p, y_p = self.map_coords[..., 0], self.map_coords[..., 1]
             eps = 1e-6
@@ -224,12 +235,83 @@ class SonarStateEstimator:
             
             self.sonar_mask = (self.r < self.max_range) & (self.theta >= a_min) & (self.theta <= a_max)
             self.flat_mask = self.sonar_mask.view(-1)
+            
+            # Explicitly extract long indices for TRT static shaping and contiguous mapping
+            self.flat_indices = torch.nonzero(self.flat_mask).squeeze(-1).long().contiguous()
             self.N_valid = self.flat_mask.sum().item()
 
+            # Initialize and trace the custom kernel
+            self.logger.info('Exporting PyTorch model to ONNX...')
+            raw_kernel = LossAndGradKernel(self.map_res, self.map_size, self.N_valid).to(self.device)
+            raw_kernel.eval()
+            
+            dummy_state = torch.zeros(3, dtype=self.dtype, device=self.device)
+            dummy_scan = torch.zeros((self.map_size, self.map_size), dtype=self.dtype, device=self.device)
+            dummy_J = torch.zeros((3, self.N_valid), dtype=self.dtype, device=self.device)
+            dummy_M = torch.zeros(self.N_valid, dtype=self.dtype, device=self.device)
+
+            onnx_path = "/tmp/sonar_kernel.onnx"
+            torch.onnx.export(
+                raw_kernel, 
+                (dummy_state, dummy_scan, dummy_J, dummy_M, self.map_coords, self.flat_indices),
+                onnx_path,
+                input_names=['state', 'scan', 'J', 'M', 'map_coords', 'flat_indices'],
+                output_names=['loss', 'grad'],
+                opset_version=16
+            )
+
+            self.logger.info('Building native TensorRT engine (this may take a minute)...')
+            TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
+            builder = trt.Builder(TRT_LOGGER)
+            
+            network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+            parser = trt.OnnxParser(network, TRT_LOGGER)
+
+            with open(onnx_path, 'rb') as model:
+                if not parser.parse(model.read()):
+                    for error in range(parser.num_errors):
+                        self.logger.error(str(parser.get_error(error)))
+                    raise RuntimeError("Failed to parse ONNX model for TensorRT.")
+
+            config = builder.create_builder_config()
+            
+            # Handle TRT versioning differences for memory constraints
+            if hasattr(config, 'set_memory_pool_limit'):
+                config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 30)
+            else:
+                config.max_workspace_size = 1 << 30
+
+            self.trt_engine = builder.build_engine(network, config)
+            self.trt_context = self.trt_engine.create_execution_context()
+
+            # Dynamically map the bindings (TensorRT doesn't guarantee order)
+            self.binding_indices = {
+                'state': self.trt_engine.get_binding_index('state'),
+                'scan': self.trt_engine.get_binding_index('scan'),
+                'J': self.trt_engine.get_binding_index('J'),
+                'M': self.trt_engine.get_binding_index('M'),
+                'map_coords': self.trt_engine.get_binding_index('map_coords'),
+                'flat_indices': self.trt_engine.get_binding_index('flat_indices'),
+                'loss': self.trt_engine.get_binding_index('loss'),
+                'grad': self.trt_engine.get_binding_index('grad')
+            }
+
+            loss_shape = tuple(self.trt_engine.get_binding_shape(self.binding_indices['loss']))
+            grad_shape = tuple(self.trt_engine.get_binding_shape(self.binding_indices['grad']))
+            
+            # Handle empty tuple for scalars returned by TRT
+            if not loss_shape: loss_shape = ()
+            if not grad_shape: grad_shape = (3,)
+
+            # Pre-allocate output tensors
+            self.loss_out = torch.empty(loss_shape, dtype=self.dtype, device=self.device)
+            self.grad_out = torch.empty(grad_shape, dtype=self.dtype, device=self.device)
+            
+            self.logger.info('TensorRT engine ready.')
+
     def preprocess_sonar(self, scan_img):
-        # Explicitly move to the correct device and strip dimensions
         scan = scan_img.clone().detach().to(device=self.device, dtype=self.dtype).squeeze()
-        if scan.max() > 2.0: # Normalize if 0-255 scale
+        if scan.max() > 2.0: 
             scan /= 255.0
         scan[scan < scan.mean() + self.denoise_factor * scan.std()] = 0.0
         return scan
@@ -287,47 +369,50 @@ class SonarStateEstimator:
         y_grid = self.map_coords[..., 1]
         M_theta = -y_grid * M_x + x_grid * M_y
 
-        M_x_valid = M_x.view(-1)[self.flat_mask]
-        M_y_valid = M_y.view(-1)[self.flat_mask]
-        M_theta_valid = M_theta.view(-1)[self.flat_mask]
+        # Use indices instead of boolean mask
+        M_x_valid = M_x.view(-1)[self.flat_indices]
+        M_y_valid = M_y.view(-1)[self.flat_indices]
+        M_theta_valid = M_theta.view(-1)[self.flat_indices]
         
         J_flat = torch.stack([M_x_valid, M_y_valid, M_theta_valid]).to(self.device)
-        M_flat = M.view(-1)[self.flat_mask]
+        M_flat = M.view(-1)[self.flat_indices]
 
         H = (J_flat @ J_flat.T) / self.N_valid
         H += torch.eye(3, dtype=self.dtype, device=self.device) * self.lm_damping
         H_inv = torch.linalg.inv(H)
 
-        state = state_init.detach().clone().flatten().to(self.device)
-        prev_loss = None
+        # Ensure tensors are contiguous for TRT pointer mappings
+        state = state_init.detach().clone().flatten().contiguous().to(self.device)
+        base_cart_scan = base_cart_scan.contiguous()
+        J_flat = J_flat.contiguous()
+        M_flat = M_flat.contiguous()
+
+        # Connect PyTorch memory pointers to the TRT execution bindings
+        bindings = [0] * self.trt_engine.num_bindings
+        bindings[self.binding_indices['state']] = state.data_ptr()
+        bindings[self.binding_indices['scan']] = base_cart_scan.data_ptr()
+        bindings[self.binding_indices['J']] = J_flat.data_ptr()
+        bindings[self.binding_indices['M']] = M_flat.data_ptr()
+        bindings[self.binding_indices['map_coords']] = self.map_coords.data_ptr()
+        bindings[self.binding_indices['flat_indices']] = self.flat_indices.data_ptr()
+        bindings[self.binding_indices['loss']] = self.loss_out.data_ptr()
+        bindings[self.binding_indices['grad']] = self.grad_out.data_ptr()
+
+        stream = torch.cuda.current_stream().cuda_stream
 
         for _ in range(1, self.iterations + 1):
-            loss, grad = compute_loss_and_grad(
-                state, base_cart_scan, J_flat, M_flat, 
-                self.map_coords, self.map_res, self.map_size,
-                self.flat_mask, self.N_valid
-            )
 
-            if not torch.isfinite(loss) or not torch.isfinite(grad).all():
-                break
+            # 1. Execute TRT async (GPU executes when ready)
+            self.trt_context.execute_async_v2(bindings=bindings, stream_handle=stream)
 
-            grad_norm = torch.linalg.vector_norm(grad)
-            if grad_norm > self.max_grad_norm:
-                grad = grad * (self.max_grad_norm / grad_norm)
-                grad_norm = self.max_grad_norm
+            # 2. PyTorch operations are queued on the same stream, 
+            # so they will automatically wait for TRT to finish on the hardware level
+            delta_q = H_inv @ self.grad_out
 
-            if grad_norm < self.grad_tol:
-                break
+            # 3. Update state in-place. NO CPU syncs!
+            state.sub_(self.lr * delta_q)
 
-            delta_q = H_inv @ grad
-            state = state - self.lr * delta_q
-
-            loss_value = loss.item()
-            if prev_loss is not None and abs(prev_loss - loss_value) < self.loss_tol:
-                break
-            prev_loss = loss_value
-
-        return state
+            return state
 
     def odometry_step(self, scan_img, current_time):
         with torch.no_grad():           
@@ -408,7 +493,7 @@ class BaseSonarOdometryNode(Node):
         self.declare_parameter('peaks_topic', '/sonar_peaks')
         self.declare_parameter('contrast', 10.0)
 
-        # Core Parameters (Matching ROS 1 Method)
+        # Core Parameters
         self.declare_parameter('mapping.update_alpha', 0.3)
         self.declare_parameter('mapping.is_warped', False)
         self.declare_parameter('mapping.noise_decay_factor', 3.0)
@@ -508,17 +593,10 @@ class BaseSonarOdometryNode(Node):
         self.current_range = max_range
         self.current_shape = (h, w)
         
-        # JIT Warmup
-        self.get_logger().info('Warming up JIT compiler...')
-        dummy_scan = torch.zeros((h, w), dtype=torch.float32, device=self.estimator.device)
-        self.estimator.odometry_step(dummy_scan, 0.0)
-        self.estimator.odometry_step(dummy_scan, 0.1)
-        
         self.estimator.step_counter = 0
         self.estimator.state.zero_()
         self.estimator.motion_model.reset()
         self.estimator.local_map.zero_()
-        self.get_logger().info('Warmup complete.')
 
     def process_sonar_scan(self, scan_tensor, max_range_m, h, w, fov_degrees, stamp):
         if self.estimator is None or self.current_range != max_range_m or self.current_shape != (h, w):
@@ -526,11 +604,9 @@ class BaseSonarOdometryNode(Node):
 
         current_time = stamp.sec + (stamp.nanosec * 1e-9) if stamp else 0.0
         
-        # Ensure scan is on the designated device before optimization
         scan_tensor = scan_tensor.to(self.estimator.device)
         self.estimator.odometry_step(scan_tensor, current_time)
 
-        # Convert to standard ROS global frame 
         pos_x = self.estimator.motion_model.pos[0].item()
         pos_y = -self.estimator.motion_model.pos[1].item()
         rot_theta = -self.estimator.motion_model.rot.item()
@@ -540,8 +616,8 @@ class BaseSonarOdometryNode(Node):
         vth = -self.estimator.motion_model.vth
 
         self.publish_odometry(stamp, pos_x, pos_y, rot_theta, vx, vy, vth)
-        self.publish_debug_images(stamp)
-        self.publish_peaks(stamp)
+        #self.publish_debug_images(stamp)
+        #self.publish_peaks(stamp)
 
     def publish_peaks(self, stamp):
         """Extracts valid points from the continuous local map and publishes them as a PointCloud2."""
@@ -570,11 +646,9 @@ class BaseSonarOdometryNode(Node):
             if num_points == 0:
                 return
 
-            # Vectorized numpy array allocation instead of slow python looping
             points_np = np.zeros((num_points, 4), dtype=np.float32)
             points_np[:, 0] = valid_coords[:, 0]
             points_np[:, 1] = -valid_coords[:, 1]
-            # Z is left at default 0.0 in index 2
             points_np[:, 3] = valid_intensities
                     
             header = Header()
@@ -582,7 +656,6 @@ class BaseSonarOdometryNode(Node):
                 header.stamp = stamp
             header.frame_id = self.child_frame_id
             
-            # Define standard fields
             fields = [
                 PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
                 PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
@@ -590,7 +663,6 @@ class BaseSonarOdometryNode(Node):
                 PointField(name='intensity', offset=12, datatype=PointField.FLOAT32, count=1),
             ]
             
-            # Manually structure the PointCloud2 message
             cloud_msg = PointCloud2()
             cloud_msg.header = header
             cloud_msg.height = 1
@@ -601,7 +673,6 @@ class BaseSonarOdometryNode(Node):
             cloud_msg.row_step = cloud_msg.point_step * num_points
             cloud_msg.is_dense = True
             
-            # Dump the numpy float array straight to a byte buffer
             cloud_msg.data = points_np.tobytes()
 
             self.peaks_pub.publish(cloud_msg)
@@ -610,7 +681,6 @@ class BaseSonarOdometryNode(Node):
             self.get_logger().error(f"Failed to publish local map point cloud: {e}")
 
     def publish_debug_images(self, stamp):
-        """Publishes Viridis-colored OpenCV images for map debugging."""
         if not hasattr(self.estimator, 'local_map') or getattr(self.estimator, 'last_cart_scan', None) is None:
             return
 
@@ -630,7 +700,6 @@ class BaseSonarOdometryNode(Node):
 
             # 2. Cartesian Scan
             scan_array = self.estimator.last_cart_scan.detach().cpu().numpy()
-            # Crop to matching active half 
             scan_array = scan_array[:, int(scan_array.shape[0]/2):]
             scan_array = np.clip(scan_array * self.contrast, 0, 1)
             scan_array = cv2.rotate(scan_array, cv2.ROTATE_90_COUNTERCLOCKWISE)
