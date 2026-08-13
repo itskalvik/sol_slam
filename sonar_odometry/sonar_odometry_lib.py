@@ -297,17 +297,20 @@ class SonarStateEstimator:
             self._setup_tensorrt()
 
     def _setup_tensorrt(self):
-        solver_onnx_path = "sonar_full_solver.onnx"
-        map_onnx_path = "sonar_map_kernel.onnx"
+        # Create a unique ID for the current sonar resolution and range
+        shape_id = f"R{self.max_range:.1f}_H{self.H_img}_W{self.W_img}"
         
-        # FP32 enforces strict precision required by tiny gradients
+        # Bake the shape ID into the filenames so auto-ranging creates separate engines
+        solver_onnx_path = f"/tmp/sonar_full_solver_{shape_id}.onnx"
+        map_onnx_path = f"/tmp/sonar_map_kernel_{shape_id}.onnx"
+        
         trt_providers = [
             ('TensorrtExecutionProvider', {
                 'device_id': 0,
                 'trt_max_workspace_size': 2147483648,
                 'trt_fp16_enable': False, 
                 'trt_engine_cache_enable': True,
-                'trt_engine_cache_path': './trt_cache'
+                'trt_engine_cache_path': f'/tmp/trt_cache_{shape_id}' # Unique cache per range
             }),
             ('CUDAExecutionProvider', {'device_id': 0})
         ]
@@ -327,7 +330,7 @@ class SonarStateEstimator:
 
         # 1. Full Solver Engine
         if not os.path.exists(solver_onnx_path):
-            self.logger.info("Exporting full solver loop to ONNX...")
+            self.logger.info(f"Exporting full solver loop to ONNX for shape {shape_id}...")
             dummy_state = torch.randn(3, dtype=self.dtype, device=self.device)
             dummy_scan = torch.rand((self.map_size, self.map_size), dtype=self.dtype, device=self.device)
             dummy_J = torch.randn((3, self.flat_indices.shape[0]), dtype=self.dtype, device=self.device)
@@ -362,7 +365,7 @@ class SonarStateEstimator:
 
         # 2. Map Update Engine
         if not os.path.exists(map_onnx_path):
-            self.logger.info("Exporting map update kernel to ONNX...")
+            self.logger.info(f"Exporting map update kernel to ONNX for shape {shape_id}...")
             dummy_pos = torch.randn(2, dtype=self.dtype, device=self.device)
             dummy_rot = torch.randn(1, dtype=self.dtype, device=self.device) 
             dummy_scan = torch.rand((self.map_size, self.map_size), dtype=self.dtype, device=self.device)

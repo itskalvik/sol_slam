@@ -38,12 +38,15 @@ class SonoptixOdometryNode(BaseSonarOdometryNode):
         cv_img = self.br.imgmsg_to_cv2(msg, desired_encoding='mono8')
         h, w = cv_img.shape
 
-        # Sonoptix generic meta-data rule
-        max_range_m = 12 
-        fov = 120 if max_range_m <= 30 else 90
+        # Extract the 8-bit encoded max range from the bottom-left pixels
+        bits = (cv_img[-1, :8] > 127).astype(np.uint8)
+        max_range_m = int(np.packbits(bits)[0])
+        
+        # Black out the data pixels so they aren't processed by cv2.remap
+        cv_img[-1, :8] = 0
 
-        # Clean the artifact pixel
-        cv_img[0, 0] = 0
+        # Sonoptix generic meta-data rule
+        fov = 120 if max_range_m <= 30 else 90
         
         # Apply the Unwarp method if the image is a fan/wedge 
         if self.needs_unwarp:
