@@ -1,11 +1,11 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>sonar_odometry</name>
-  <version>0.0.0</version>
-  <description>TODO: Package description</description>
-  <maintainer email="user@todo.todo">user</maintainer>
-  <license>TODO: License declaration</license>
+  <name>sol_slam</name>
+  <version>0.0.1</version>
+  <description>Sonar-Only Local SLAM</description>
+  <maintainer email="itskalvik@gmail.com">Kalvik Jakkala</maintainer>
+  <license>Apache License 2.0</license>
 
   <depend>rclpy</depend>
   <depend>cv_bridge</depend>

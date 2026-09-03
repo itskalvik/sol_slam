@@ -211,15 +211,15 @@ class RobotMotionModel:
 
 
 # ==========================================
-# State Estimator 
+# SOL-SLAM State Estimator
 # ==========================================
-class SonarStateEstimator:
+class SOLSLAM:
     def __init__(self, opts, res, h, w, node_logger):
         with torch.no_grad():
             self.device = get_best_device()
             self.dtype = torch.float32
             self.logger = node_logger
-            self.logger.info(f"SonarStateEstimator initializing on device: {self.device.type.upper()}")
+            self.logger.info(f"SOL-SLAM initializing on device: {self.device.type.upper()}")
             
             self.sonar_res = torch.tensor(res, dtype=self.dtype, device=self.device)
             self.step_counter = 0
@@ -411,18 +411,18 @@ class SonarStateEstimator:
 # ==========================================
 # ROS 2 Base Class
 # ==========================================
-class BaseSonarOdometryNode(Node):
-    def __init__(self, node_name='base_sonar_odometry'):
+class SOLSLAMBaseNode(Node):
+    def __init__(self, node_name='sol_slam_base'):
         super().__init__(node_name)
 
         self.declare_parameter('odom_frame_id', 'odom')
         self.declare_parameter('child_frame_id', 'base_link')
-        self.declare_parameter('topic_out', '/odom')
-        self.declare_parameter('path_topic', '/sonar_path')
+        self.declare_parameter('topic_out', '/sol_slam/odom')
+        self.declare_parameter('path_topic', '/sol_slam/path')
 
-        self.declare_parameter('scan_img_topic', '/sonar_scan_img')
-        self.declare_parameter('map_img_topic', '/sonar_map_img')
-        self.declare_parameter('peaks_topic', '/sonar_peaks')
+        self.declare_parameter('scan_img_topic', '/sol_slam/denoised_scan')
+        self.declare_parameter('map_img_topic', '/sol_slam/map')
+        self.declare_parameter('peaks_topic', '/sol_slam/peaks')
         self.declare_parameter('contrast', 10.0)
 
         self.declare_parameter('enable_debug_viz', True)
@@ -524,7 +524,7 @@ class BaseSonarOdometryNode(Node):
             }
         }
         
-        self.estimator = SonarStateEstimator(opts, res, h, w, self.get_logger())
+        self.estimator = SOLSLAM(opts, res, h, w, self.get_logger())
         self.current_range = max_range
         self.current_shape = (h, w)
         
