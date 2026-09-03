@@ -1,35 +1,31 @@
-import rclpy
-from rclpy.node import Node
 import math
 import numpy as np
 import cv2
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-import torch._dynamo
 import torchvision
+import rclpy
+from rclpy.node import Node
 
 from std_msgs.msg import Header
 from sensor_msgs.msg import Image, PointCloud2, PointField
 from nav_msgs.msg import Odometry, Path
-from geometry_msgs.msg import TransformStamped, Quaternion, PoseStamped, Point
+from geometry_msgs.msg import TransformStamped, Quaternion, PoseStamped
 from tf2_ros import TransformBroadcaster
 from rcl_interfaces.msg import SetParametersResult
 from std_srvs.srv import Trigger
 from cv_bridge import CvBridge
 
-torch._dynamo.config.suppress_errors = True
-
 # ==========================================
 # Helper Functions & Device Management
 # ==========================================
 def get_best_device():
-    """Returns the most performant available torch device."""
     if torch.cuda.is_available():
         return torch.device('cuda')
     elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
         return torch.device('mps')
-    else:
-        return torch.device('cpu')
+    return torch.device('cpu')
 
 def get_rotation_matrix(rot, dtype=torch.float32, device='cpu'):
     c, s = torch.cos(rot), torch.sin(rot)
@@ -39,7 +35,6 @@ def get_rotation_matrix(rot, dtype=torch.float32, device='cpu'):
     return rot_mat
 
 def unwarp_sonar(warped_image, fov=130, num_beams=768):
-    """Utility to convert a fan-shaped sonar wedge into a raw polar matrix using OpenCV (CPU)"""
     h, d = warped_image.shape[:2]
     canvas = np.zeros((h * 2, h * 2), dtype=warped_image.dtype)
     s = (h * 2 - d) // 2
@@ -60,38 +55,117 @@ def unwarp_sonar(warped_image, fov=130, num_beams=768):
 
 
 # ==========================================
-# Optimized Gradient Kernel
+# Solver & Map Update Modules
 # ==========================================
-@torch.compile(mode="reduce-overhead")
-def compute_loss_and_grad(state, base_cart_scan, J_flat, M_flat, map_coords, map_res, map_size, flat_mask, N_valid):
-    tx, ty, theta = state[0], state[1], state[2]
-    cos_r, sin_r = torch.cos(theta), torch.sin(theta)
-    
-    x_shifted = map_coords[..., 0] - tx
-    y_shifted = map_coords[..., 1] - ty
-    
-    x_old = x_shifted * cos_r + y_shifted * sin_r
-    y_old = -x_shifted * sin_r + y_shifted * cos_r
-    
-    half_extent = map_res * (map_size - 1) / 2.0
-    norm_x = x_old / half_extent
-    norm_y = y_old / half_extent
-    
-    grid = torch.stack([norm_x, norm_y], dim=-1).unsqueeze(0)
-    
-    warped_scan = F.grid_sample(
-        base_cart_scan.view(1, 1, map_size, map_size), 
-        grid, 
-        align_corners=True, 
-        padding_mode='zeros'
-    ).squeeze()
-    
-    warped_flat = warped_scan.view(-1)[flat_mask]
-    
-    grad = -(J_flat @ warped_flat) / N_valid
-    loss = -torch.dot(M_flat, warped_flat) / N_valid
-    
-    return loss, grad
+class FullSolverKernel(nn.Module):
+    """
+    Computes all iterations and returns the state that achieved the lowest loss.
+    Guarantees mathematically stable alignment even if the solver diverges later.
+    """
+    def __init__(self, map_res, map_size, iterations, lr, max_grad_norm, N_valid):
+        super().__init__()
+        self.map_res = float(map_res)
+        self.map_size = int(map_size)
+        self.half_extent = self.map_res * (self.map_size - 1) / 2.0
+        
+        self.iterations = int(iterations)
+        self.lr = float(lr)
+        self.max_grad_norm = float(max_grad_norm)
+        self.N_valid = float(N_valid)
+
+    def forward(self, state_init, base_cart_scan, J_flat, M_flat, H_inv, map_coords, flat_indices):
+        state = state_init.clone()
+        
+        best_state = state.clone()
+        best_loss = torch.tensor(float('inf'), dtype=state.dtype, device=state.device)
+        
+        for _ in range(self.iterations):
+            tx, ty, theta = state[0], state[1], state[2]
+            cos_r, sin_r = torch.cos(theta), torch.sin(theta)
+            
+            x_shifted = map_coords[..., 0] - tx
+            y_shifted = map_coords[..., 1] - ty
+            
+            x_old = x_shifted * cos_r + y_shifted * sin_r
+            y_old = -x_shifted * sin_r + y_shifted * cos_r
+            
+            norm_x = x_old / self.half_extent
+            norm_y = y_old / self.half_extent
+            
+            grid = torch.stack([norm_x, norm_y], dim=-1).unsqueeze(0)
+            
+            warped_scan = F.grid_sample(
+                base_cart_scan.view(1, 1, self.map_size, self.map_size), 
+                grid, align_corners=True, padding_mode='zeros'
+            ).squeeze()
+            
+            warped_flat = warped_scan.view(-1)[flat_indices]
+            
+            grad = -(J_flat @ warped_flat) / self.N_valid
+            loss = -torch.dot(M_flat, warped_flat) / self.N_valid
+            
+            # --- Trajectory Selection Logic ---
+            is_better = loss < best_loss
+            best_loss = torch.where(is_better, loss, best_loss)
+            best_state = torch.where(is_better, state, best_state)
+            
+            # --- Continue Optimization Path with Clamped Grad Norm ---
+            grad_norm = torch.linalg.vector_norm(grad)
+            grad_norm_safe = torch.clamp(grad_norm, min=1e-8)
+            clip_factor = torch.clamp(self.max_grad_norm / grad_norm_safe, max=1.0)
+            grad = grad * clip_factor
+            
+            delta_q = torch.matmul(H_inv, grad)
+            state = state - self.lr * delta_q
+            
+        return best_state
+
+
+class MapUpdateKernel(nn.Module):
+    def __init__(self, map_res, map_size):
+        super().__init__()
+        self.map_res = map_res
+        self.map_size = map_size
+
+    def forward(self, delta_pos, delta_rot, local_map, base_cart_scan, map_coords, sonar_mask, alpha, noise_decay_factor):
+        cos_r, sin_r = torch.cos(delta_rot), torch.sin(delta_rot)
+        
+        x = map_coords[..., 0]
+        y = map_coords[..., 1]
+        
+        x_shifted = x * cos_r - y * sin_r + delta_pos[0]
+        y_shifted = x * sin_r + y * cos_r + delta_pos[1]
+        
+        pixel_x = (x_shifted / self.map_res) + (self.map_size // 2)
+        pixel_y = (y_shifted / self.map_res) + (self.map_size // 2)
+        
+        norm_x = (pixel_x / (self.map_size - 1) * 2) - 1
+        norm_y = (pixel_y / (self.map_size - 1) * 2) - 1
+        
+        grid = torch.stack([norm_x, norm_y], dim=-1).unsqueeze(0)
+        
+        shifted_map = F.grid_sample(
+            local_map.view(1, 1, self.map_size, self.map_size),
+            grid,
+            mode='bilinear', padding_mode='zeros', align_corners=True
+        ).squeeze()
+
+        valid_scan = base_cart_scan > 0
+        update_mask = sonar_mask & valid_scan
+        
+        one_tensor = torch.tensor(1.0, dtype=alpha.dtype, device=alpha.device)
+        updated_map = torch.where(
+            update_mask,
+            (one_tensor - alpha) * shifted_map + alpha * base_cart_scan,
+            shifted_map
+        )
+        
+        mean_val = updated_map.mean()
+        std_val = updated_map.std()
+        cutoff = mean_val + noise_decay_factor * std_val
+        
+        final_map = torch.where(updated_map < cutoff, torch.zeros_like(updated_map), updated_map)
+        return final_map
 
 
 # ==========================================
@@ -101,16 +175,9 @@ class RobotMotionModel:
     def __init__(self, dtype=torch.float32, device='cpu'):
         self.dtype = dtype
         self.device = device
-        
-        # Global Pose State
         self.pos = torch.zeros(2, dtype=self.dtype, device=self.device)
         self.rot = torch.tensor(0.0, dtype=self.dtype, device=self.device)
-        
-        # Velocity State (Local Frame)
-        self.vx = 0.0
-        self.vy = 0.0
-        self.vth = 0.0
-        
+        self.vx, self.vy, self.vth = 0.0, 0.0, 0.0
         self.last_time = None
 
     def reset(self):
@@ -122,30 +189,24 @@ class RobotMotionModel:
     def get_state_guess(self, current_time, default_guess):
         state_guess = torch.zeros(3, dtype=self.dtype, device=self.device)
         dt = current_time - self.last_time
-        
         if dt > 1e-4:
             state_guess[0] = self.vx * dt
             state_guess[1] = self.vy * dt
             state_guess[2] = self.vth * dt
         else:
             state_guess = default_guess.clone().to(self.device)
-            
         return state_guess
 
     def update(self, frame_pos, frame_rot, current_time):
         dt = current_time - self.last_time
-        
         if dt > 1e-4:
             self.vx = frame_pos[0].item() / dt
             self.vy = frame_pos[1].item() / dt
             self.vth = frame_rot.item() / dt
-        
         self.last_time = current_time
-        
         rot_m = get_rotation_matrix(self.rot, dtype=self.dtype, device=self.device)
         self.pos += rot_m @ frame_pos
         self.rot += frame_rot
-        
         return self.pos, self.rot
 
 
@@ -153,7 +214,7 @@ class RobotMotionModel:
 # State Estimator 
 # ==========================================
 class SonarStateEstimator:
-    def __init__(self, opts, res, node_logger):
+    def __init__(self, opts, res, h, w, node_logger):
         with torch.no_grad():
             self.device = get_best_device()
             self.dtype = torch.float32
@@ -166,17 +227,19 @@ class SonarStateEstimator:
             self.state = torch.zeros(3, dtype=self.dtype, device=self.device)
             self.motion_model = RobotMotionModel(dtype=self.dtype, device=self.device)
 
-            # Mapping parameters
+            self.H_img = h
+            self.W_img = w
             self.map_res = float(opts['mapping']['res'])
             self.max_range = float(opts['mapping']['max_range'])
             self.alpha = torch.tensor(opts['mapping']['update_alpha'], dtype=self.dtype, device=self.device)
             self.is_warped = bool(opts['mapping'].get('is_warped', False))
+            self.noise_decay_factor_tensor = torch.tensor(
+                opts['mapping'].get('noise_decay_factor', 4.0), dtype=self.dtype, device=self.device
+            )
             
             self.blur_kernel_size = opts['mapping'].get('blur_kernel_size', [1, 1])
             self.blur_sigma = float(opts['mapping'].get('blur_sigma', 0.0))
-            self.noise_decay_factor = float(opts['mapping'].get('noise_decay_factor', 4.0))
             self.denoise_factor = float(opts['mapping'].get('denoise_factor', 3.25))
-            
             self.min_intensity_threshold = float(opts['mapping'].get('min_intensity_threshold', 0.1))
             self.min_valid_fraction = float(opts['mapping'].get('min_valid_fraction', 0.01))
 
@@ -190,18 +253,15 @@ class SonarStateEstimator:
 
             self.map_size = int(self.max_range / self.map_res) * 2 + 1
             
-            # Solver parameters
             solver_opts = opts.get('solver', {})
             self.iterations = int(solver_opts.get('iterations', 15)) 
             self.lr = float(solver_opts.get('lr', 1.0)) 
-            self.grad_tol = float(solver_opts.get('grad_tol', 1e-6))
-            self.loss_tol = float(solver_opts.get('loss_tol', 1e-9))
             self.max_grad_norm = float(solver_opts.get('max_grad_norm', 10.0))
             self.lm_damping = float(solver_opts.get('lm_damping', 1e-3)) 
-            
             self.bound_factor = float(solver_opts.get('bound_factor', 1.75))
-            self.fallback_bound = torch.tensor(solver_opts.get('fallback_bound', [0.25, 0.25, 0.08725]), 
-                                               dtype=self.dtype, device=self.device)
+            self.fallback_bound = torch.tensor(
+                solver_opts.get('fallback_bound', [0.25, 0.25, 0.08725]), dtype=self.dtype, device=self.device
+            )
 
             self.local_map = torch.zeros((self.map_size, self.map_size), dtype=self.dtype, device=self.device)
             self.local_map_blurred = torch.zeros_like(self.local_map)
@@ -209,7 +269,7 @@ class SonarStateEstimator:
             
             axis = (torch.arange(self.map_size, dtype=self.dtype, device=self.device) - self.map_size // 2) * self.map_res
             grid_y, grid_x = torch.meshgrid(axis, axis, indexing='ij')
-            self.map_coords = torch.stack([grid_x, grid_y], dim=-1).to(self.device)
+            self.map_coords = torch.stack([grid_x, grid_y], dim=-1).to(self.device).contiguous()
 
             x_p, y_p = self.map_coords[..., 0], self.map_coords[..., 1]
             eps = 1e-6
@@ -224,56 +284,43 @@ class SonarStateEstimator:
             
             self.sonar_mask = (self.r < self.max_range) & (self.theta >= a_min) & (self.theta <= a_max)
             self.flat_mask = self.sonar_mask.view(-1)
-            self.N_valid = self.flat_mask.sum().item()
+            self.flat_indices = torch.nonzero(self.flat_mask).squeeze().to(torch.int64).contiguous()
+            self.N_valid_tensor = torch.tensor([self.flat_mask.sum().item()], dtype=self.dtype, device=self.device)
+            
+            # Precompute Cartesian projection grid
+            if self.is_warped:
+                norm_y = 1.0 - 2.0 * (x_safe / self.max_range)
+                norm_x = -(y_safe / self.half_width_phys)
+                self.cart_proj_grid = torch.stack([norm_x, norm_y], dim=-1).unsqueeze(0).to(self.device)
+            else:
+                a_idx = (self.theta - a_min) / (a_max - a_min) * (self.W_img - 1)
+                r_idx = self.r / self.sonar_res
+                norm_a = (a_idx / (self.W_img - 1) * 2) - 1
+                norm_r = (r_idx / (self.H_img - 1) * 2) - 1
+                self.cart_proj_grid = torch.stack([norm_a, norm_r], dim=-1).unsqueeze(0).to(self.device)
+
+            # Instantiate optimization and map modules
+            self.solver_kernel = FullSolverKernel(
+                self.map_res, self.map_size, self.iterations, self.lr, 
+                self.max_grad_norm, self.N_valid_tensor.item()
+            ).to(self.device)
+            self.map_kernel = MapUpdateKernel(self.map_res, self.map_size).to(self.device)
 
     def preprocess_sonar(self, scan_img):
-        # Explicitly move to the correct device and strip dimensions
         scan = scan_img.clone().detach().to(device=self.device, dtype=self.dtype).squeeze()
-        if scan.max() > 2.0: # Normalize if 0-255 scale
+        if scan.max() > 2.0: 
             scan /= 255.0
         scan[scan < scan.mean() + self.denoise_factor * scan.std()] = 0.0
         return scan
 
     def get_cartesian_projection(self, scan_img):
-        local_x, local_y = self.map_coords[..., 0], self.map_coords[..., 1]
-        H_img, W_img = scan_img.shape 
-
-        if self.is_warped:
-            norm_y = 1.0 - 2.0 * (local_x / self.max_range)
-            norm_x = -(local_y / self.half_width_phys)
-            coords = torch.stack([norm_x, norm_y], dim=-1).to(self.device)
-        else:
-            a_min, a_max = self.beam_angles[0], self.beam_angles[-1]
-            a_idx = (self.theta - a_min) / (a_max - a_min) * (W_img - 1)
-            r_idx = self.r / self.sonar_res
-            norm_a = (a_idx / (W_img - 1) * 2) - 1
-            norm_r = (r_idx / (H_img - 1) * 2) - 1
-            coords = torch.stack([norm_a, norm_r], dim=-1).to(self.device)
-
         cart = F.grid_sample(
-            scan_img.view(1, 1, H_img, W_img), 
-            coords.unsqueeze(0), 
+            scan_img.view(1, 1, self.H_img, self.W_img), 
+            self.cart_proj_grid, 
             mode='bilinear', padding_mode='zeros', align_corners=True
         ).squeeze()
-        
         return torch.where(self.sonar_mask, cart, 0.0)
 
-    def move_local_map(self, delta_pos, delta_rot):
-        if torch.norm(delta_pos) < 1e-4 and torch.abs(delta_rot) < 1e-5: 
-            return
-        
-        rot_mat = get_rotation_matrix(delta_rot, dtype=self.dtype, device=self.device)
-        shifted = (self.map_coords.view(-1, 2) @ rot_mat.T) + delta_pos
-        
-        pixel_idx = (shifted / self.map_res) + (self.map_size // 2)
-        pixel_idx = (pixel_idx / (self.map_size - 1) * 2) - 1
-        
-        self.local_map = F.grid_sample(
-            self.local_map.view(1, 1, self.map_size, self.map_size), 
-            pixel_idx.view(1, self.map_size, self.map_size, 2),
-            mode='bilinear', padding_mode='zeros', align_corners=True
-        ).squeeze()
-        
     def solve(self, state_init, base_cart_scan):
         res = self.map_res
         M = self.local_map_blurred.detach()
@@ -287,47 +334,20 @@ class SonarStateEstimator:
         y_grid = self.map_coords[..., 1]
         M_theta = -y_grid * M_x + x_grid * M_y
 
-        M_x_valid = M_x.view(-1)[self.flat_mask]
-        M_y_valid = M_y.view(-1)[self.flat_mask]
-        M_theta_valid = M_theta.view(-1)[self.flat_mask]
+        M_x_valid = M_x.view(-1)[self.flat_indices]
+        M_y_valid = M_y.view(-1)[self.flat_indices]
+        M_theta_valid = M_theta.view(-1)[self.flat_indices]
         
         J_flat = torch.stack([M_x_valid, M_y_valid, M_theta_valid]).to(self.device)
-        M_flat = M.view(-1)[self.flat_mask]
+        M_flat = M.view(-1)[self.flat_indices]
 
-        H = (J_flat @ J_flat.T) / self.N_valid
+        H = (J_flat @ J_flat.T) / self.N_valid_tensor.item()
         H += torch.eye(3, dtype=self.dtype, device=self.device) * self.lm_damping
         H_inv = torch.linalg.inv(H)
 
-        state = state_init.detach().clone().flatten().to(self.device)
-        prev_loss = None
-
-        for _ in range(1, self.iterations + 1):
-            loss, grad = compute_loss_and_grad(
-                state, base_cart_scan, J_flat, M_flat, 
-                self.map_coords, self.map_res, self.map_size,
-                self.flat_mask, self.N_valid
-            )
-
-            if not torch.isfinite(loss) or not torch.isfinite(grad).all():
-                break
-
-            grad_norm = torch.linalg.vector_norm(grad)
-            if grad_norm > self.max_grad_norm:
-                grad = grad * (self.max_grad_norm / grad_norm)
-                grad_norm = self.max_grad_norm
-
-            if grad_norm < self.grad_tol:
-                break
-
-            delta_q = H_inv @ grad
-            state = state - self.lr * delta_q
-
-            loss_value = loss.item()
-            if prev_loss is not None and abs(prev_loss - loss_value) < self.loss_tol:
-                break
-            prev_loss = loss_value
-
-        return state
+        return self.solver_kernel(
+            state_init.flatten(), base_cart_scan, J_flat, M_flat, H_inv, self.map_coords, self.flat_indices
+        )
 
     def odometry_step(self, scan_img, current_time):
         with torch.no_grad():           
@@ -336,10 +356,10 @@ class SonarStateEstimator:
 
             footprint_pixels = base_cart_scan[self.sonar_mask]
             active_pixels_count = (footprint_pixels > self.min_intensity_threshold).sum().float()
-            active_fraction = (active_pixels_count / self.N_valid).item()
+            active_fraction = (active_pixels_count / self.N_valid_tensor.item()).item()
 
             if active_fraction < self.min_valid_fraction:
-                self.logger.warn(f"Empty scan detected (Fraction: {active_fraction:.4f}). Skipping optimization.", throttle_duration_sec=1.0)
+                self.logger.warn("Empty scan detected. Skipping optimization.", throttle_duration_sec=1.0)
                 self.motion_model.last_time = current_time
                 self.motion_model.vx, self.motion_model.vy, self.motion_model.vth = 0.0, 0.0, 0.0
                 return
@@ -348,34 +368,33 @@ class SonarStateEstimator:
                 state_guess = self.motion_model.get_state_guess(current_time, default_guess=self.state)
                 proposed_state = self.solve(state_guess, base_cart_scan)
                 
-                # Bounding & Rejection
+                is_nan = torch.isnan(proposed_state).any().item()
+                
                 current_bound = self.fallback_bound
                 if torch.norm(state_guess) > 1e-5:
                     dynamic_bound = torch.abs(state_guess) * self.bound_factor
                     current_bound = torch.max(dynamic_bound, self.fallback_bound)
 
-                if (torch.abs(proposed_state[0]) > current_bound[0]) or \
+                if is_nan or \
+                   (torch.abs(proposed_state[0]) > current_bound[0]) or \
                    (torch.abs(proposed_state[1]) > current_bound[1]) or \
                    (torch.abs(proposed_state[2]) > current_bound[2]):
                     
-                    self.logger.warn("Optimization Rejected. Movement exceeded bounds.", throttle_duration_sec=1.0)
+                    self.logger.warn("Optimization Rejected. Divergence or bounds exceeded.", throttle_duration_sec=1.0)
                     self.state = state_guess 
                 else:
                     self.state = proposed_state
 
                 frame_pos, frame_rot = self.state[0:2], self.state[2]
-
                 self.motion_model.update(frame_pos, frame_rot, current_time)
-                self.move_local_map(frame_pos, frame_rot)
                 
-                mask_2d = self.sonar_mask
-                valid_scan = base_cart_scan > 0
-                update_mask = mask_2d & valid_scan
-                
-                self.local_map[update_mask] = (1 - self.alpha) * self.local_map[update_mask] + self.alpha * base_cart_scan[update_mask]
-                self.local_map[self.local_map < (self.local_map.mean() + self.noise_decay_factor * self.local_map.std())] = 0.0
+                if torch.norm(frame_pos) > 1e-4 or torch.abs(frame_rot) > 1e-5:
+                    self.local_map = self.map_kernel(
+                        frame_pos, frame_rot.view(1), self.local_map, base_cart_scan,
+                        self.map_coords, self.sonar_mask, self.alpha, self.noise_decay_factor_tensor
+                    )
             else:
-                self.local_map = base_cart_scan.clone().to(self.device)
+                self.local_map.copy_(base_cart_scan)
                 self.motion_model.last_time = current_time
 
             if self.blur_kernel_size[0] > 1:
@@ -396,19 +415,18 @@ class BaseSonarOdometryNode(Node):
     def __init__(self, node_name='base_sonar_odometry'):
         super().__init__(node_name)
 
-        # Frame Parameters
         self.declare_parameter('odom_frame_id', 'odom')
         self.declare_parameter('child_frame_id', 'base_link')
         self.declare_parameter('topic_out', '/odom')
         self.declare_parameter('path_topic', '/sonar_path')
 
-        # Visual Debug Parameters
         self.declare_parameter('scan_img_topic', '/sonar_scan_img')
         self.declare_parameter('map_img_topic', '/sonar_map_img')
         self.declare_parameter('peaks_topic', '/sonar_peaks')
         self.declare_parameter('contrast', 10.0)
 
-        # Core Parameters (Matching ROS 1 Method)
+        self.declare_parameter('enable_debug_viz', True)
+
         self.declare_parameter('mapping.update_alpha', 0.3)
         self.declare_parameter('mapping.is_warped', False)
         self.declare_parameter('mapping.noise_decay_factor', 3.0)
@@ -418,25 +436,28 @@ class BaseSonarOdometryNode(Node):
 
         self.declare_parameter('solver.iterations', 15)
         self.declare_parameter('solver.lr', 1.0)
-        self.declare_parameter('solver.grad_tol', 1e-6)
-        self.declare_parameter('solver.loss_tol', 1e-9)
         self.declare_parameter('solver.max_grad_norm', 10.0)
         self.declare_parameter('solver.lm_damping', 1e-3)
         self.declare_parameter('solver.bound_factor', 1.75)
+        
+        # Kept for launch parameter backward compatibility
+        self.declare_parameter('solver.grad_tol', 1e-6)
+        self.declare_parameter('solver.loss_tol', 1e-9)
 
         self.odom_frame_id = self.get_parameter('odom_frame_id').value
         self.child_frame_id = self.get_parameter('child_frame_id').value
         self.contrast = self.get_parameter('contrast').value
+        self.enable_debug_viz = self.get_parameter('enable_debug_viz').value
         
         self.tf_broadcaster = TransformBroadcaster(self)
         self.odom_pub = self.create_publisher(Odometry, self.get_parameter('topic_out').value, 10)
         self.path_pub = self.create_publisher(Path, self.get_parameter('path_topic').value, 10)
-        self.peaks_pub = self.create_publisher(PointCloud2, self.get_parameter('peaks_topic').value, 10)
-
-        # Vision Debug Publishers
-        self.scan_img_pub = self.create_publisher(Image, self.get_parameter('scan_img_topic').value, 10)
-        self.map_img_pub = self.create_publisher(Image, self.get_parameter('map_img_topic').value, 10)
-        self.bridge = CvBridge()
+        
+        if self.enable_debug_viz:
+            self.peaks_pub = self.create_publisher(PointCloud2, self.get_parameter('peaks_topic').value, 10)
+            self.scan_img_pub = self.create_publisher(Image, self.get_parameter('scan_img_topic').value, 10)
+            self.map_img_pub = self.create_publisher(Image, self.get_parameter('map_img_topic').value, 10)
+            self.bridge = CvBridge()
 
         self.path_msg = Path()
         self.path_msg.header.frame_id = self.odom_frame_id
@@ -453,13 +474,14 @@ class BaseSonarOdometryNode(Node):
         for param in params:
             if param.name == 'contrast':
                 self.contrast = param.value
-                self.get_logger().info(f"Visual contrast updated to {self.contrast}")
+            elif param.name == 'enable_debug_viz':
+                self.enable_debug_viz = param.value
             if self.estimator is not None:
                 if param.name == 'mapping.update_alpha':
                     self.estimator.alpha = torch.tensor(param.value, device=self.estimator.device)
                 elif param.name == 'solver.lr':
-                    self.estimator.lr = param.value
-                self.get_logger().info(f"Param Updated -> '{param.name}': {param.value}")
+                    self.estimator.lr = float(param.value)
+                    self.estimator.solver_kernel.lr = float(param.value)
         return result
 
     def reset_odometry_callback(self, request, response):
@@ -495,8 +517,6 @@ class BaseSonarOdometryNode(Node):
             'solver': {
                 'iterations': self.get_parameter('solver.iterations').value, 
                 'lr': self.get_parameter('solver.lr').value, 
-                'grad_tol': self.get_parameter('solver.grad_tol').value, 
-                'loss_tol': self.get_parameter('solver.loss_tol').value, 
                 'max_grad_norm': self.get_parameter('solver.max_grad_norm').value, 
                 'lm_damping': self.get_parameter('solver.lm_damping').value,
                 'bound_factor': self.get_parameter('solver.bound_factor').value,
@@ -504,21 +524,14 @@ class BaseSonarOdometryNode(Node):
             }
         }
         
-        self.estimator = SonarStateEstimator(opts, res, self.get_logger())
+        self.estimator = SonarStateEstimator(opts, res, h, w, self.get_logger())
         self.current_range = max_range
         self.current_shape = (h, w)
-        
-        # JIT Warmup
-        self.get_logger().info('Warming up JIT compiler...')
-        dummy_scan = torch.zeros((h, w), dtype=torch.float32, device=self.estimator.device)
-        self.estimator.odometry_step(dummy_scan, 0.0)
-        self.estimator.odometry_step(dummy_scan, 0.1)
         
         self.estimator.step_counter = 0
         self.estimator.state.zero_()
         self.estimator.motion_model.reset()
         self.estimator.local_map.zero_()
-        self.get_logger().info('Warmup complete.')
 
     def process_sonar_scan(self, scan_tensor, max_range_m, h, w, fov_degrees, stamp):
         if self.estimator is None or self.current_range != max_range_m or self.current_shape != (h, w):
@@ -526,11 +539,9 @@ class BaseSonarOdometryNode(Node):
 
         current_time = stamp.sec + (stamp.nanosec * 1e-9) if stamp else 0.0
         
-        # Ensure scan is on the designated device before optimization
         scan_tensor = scan_tensor.to(self.estimator.device)
         self.estimator.odometry_step(scan_tensor, current_time)
 
-        # Convert to standard ROS global frame 
         pos_x = self.estimator.motion_model.pos[0].item()
         pos_y = -self.estimator.motion_model.pos[1].item()
         rot_theta = -self.estimator.motion_model.rot.item()
@@ -540,11 +551,12 @@ class BaseSonarOdometryNode(Node):
         vth = -self.estimator.motion_model.vth
 
         self.publish_odometry(stamp, pos_x, pos_y, rot_theta, vx, vy, vth)
-        self.publish_debug_images(stamp)
-        self.publish_peaks(stamp)
+        
+        if self.enable_debug_viz:
+            self.publish_debug_images(stamp)
+            self.publish_peaks(stamp)
 
     def publish_peaks(self, stamp):
-        """Extracts valid points from the continuous local map and publishes them as a PointCloud2."""
         if not hasattr(self.estimator, 'local_map') or self.estimator.local_map is None:
             return
 
@@ -559,7 +571,6 @@ class BaseSonarOdometryNode(Node):
             valid_coords = self.estimator.map_coords[mask].cpu().numpy()
             valid_intensities = map_tensor[mask].cpu().numpy()
             
-            # Filter out points within 1 meter (often sonar housing artifact/vehicle body)
             r2 = valid_coords[:, 0]**2 + valid_coords[:, 1]**2
             valid_mask = r2 > 1.0
             
@@ -570,11 +581,9 @@ class BaseSonarOdometryNode(Node):
             if num_points == 0:
                 return
 
-            # Vectorized numpy array allocation instead of slow python looping
             points_np = np.zeros((num_points, 4), dtype=np.float32)
             points_np[:, 0] = valid_coords[:, 0]
             points_np[:, 1] = -valid_coords[:, 1]
-            # Z is left at default 0.0 in index 2
             points_np[:, 3] = valid_intensities
                     
             header = Header()
@@ -582,7 +591,6 @@ class BaseSonarOdometryNode(Node):
                 header.stamp = stamp
             header.frame_id = self.child_frame_id
             
-            # Define standard fields
             fields = [
                 PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
                 PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
@@ -590,18 +598,15 @@ class BaseSonarOdometryNode(Node):
                 PointField(name='intensity', offset=12, datatype=PointField.FLOAT32, count=1),
             ]
             
-            # Manually structure the PointCloud2 message
             cloud_msg = PointCloud2()
             cloud_msg.header = header
             cloud_msg.height = 1
             cloud_msg.width = num_points
             cloud_msg.fields = fields
             cloud_msg.is_bigendian = False
-            cloud_msg.point_step = 16  # 4 floats * 4 bytes each
+            cloud_msg.point_step = 16
             cloud_msg.row_step = cloud_msg.point_step * num_points
             cloud_msg.is_dense = True
-            
-            # Dump the numpy float array straight to a byte buffer
             cloud_msg.data = points_np.tobytes()
 
             self.peaks_pub.publish(cloud_msg)
@@ -610,12 +615,10 @@ class BaseSonarOdometryNode(Node):
             self.get_logger().error(f"Failed to publish local map point cloud: {e}")
 
     def publish_debug_images(self, stamp):
-        """Publishes Viridis-colored OpenCV images for map debugging."""
         if not hasattr(self.estimator, 'local_map') or getattr(self.estimator, 'last_cart_scan', None) is None:
             return
 
         try:
-            # 1. Local Map
             map_array = self.estimator.local_map.detach().cpu().numpy()
             map_array = np.clip(map_array * self.contrast, 0, 1)
             map_array = cv2.rotate(map_array, cv2.ROTATE_90_COUNTERCLOCKWISE)
@@ -628,9 +631,7 @@ class BaseSonarOdometryNode(Node):
             map_img_msg.header.frame_id = self.odom_frame_id
             self.map_img_pub.publish(map_img_msg)
 
-            # 2. Cartesian Scan
             scan_array = self.estimator.last_cart_scan.detach().cpu().numpy()
-            # Crop to matching active half 
             scan_array = scan_array[:, int(scan_array.shape[0]/2):]
             scan_array = np.clip(scan_array * self.contrast, 0, 1)
             scan_array = cv2.rotate(scan_array, cv2.ROTATE_90_COUNTERCLOCKWISE)
