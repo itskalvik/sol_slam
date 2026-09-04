@@ -273,6 +273,11 @@ class SOLSLAMCore:
 
             if self.enable_tensorrt:
                 self._setup_tensorrt()
+            else:
+                # Fallback to torch.compile for PyTorch 2.x performance gains
+                if hasattr(torch, 'compile'):
+                    self.solver_kernel = torch.compile(self.solver_kernel, mode="reduce-overhead")
+                    self.map_kernel = torch.compile(self.map_kernel, mode="reduce-overhead")
 
     def _setup_tensorrt(self):
         shape_id = f"R{self.max_range:.1f}_H{self.H_img}_W{self.W_img}"
@@ -376,10 +381,15 @@ class SOLSLAMCore:
             torch.cuda.synchronize()
             return self.trt_final_state.clone()
         else:
-            return self.solver_kernel(state_init.flatten(), base_cart_scan, J_flat, M_flat, H_inv, self.map_coords, self.flat_indices)
+            # Clone the output to detach it from the compiled graph's static memory
+            return self.solver_kernel(state_init.flatten(), base_cart_scan, J_flat, M_flat, H_inv, self.map_coords, self.flat_indices).clone()
 
     def process_frame(self, frame: SonarFrame):
         with torch.no_grad():
+            # Signal the start of a new step for CUDA Graphs
+            if hasattr(torch.compiler, 'cudagraph_mark_step_begin'):
+                torch.compiler.cudagraph_mark_step_begin()
+
             clean_scan = self.preprocess_sonar(frame.scan_tensor)
             base_cart_scan = self.get_cartesian_projection(clean_scan)
 
@@ -411,7 +421,8 @@ class SOLSLAMCore:
                         torch.cuda.synchronize()
                         self.local_map.copy_(self.trt_final_map)
                     else:
-                        self.local_map = self.map_kernel(f_pos, f_rot.view(1), self.local_map, base_cart_scan, self.map_coords, self.sonar_mask, self.alpha, self.noise_decay_factor_tensor)
+                        # Clone the updated map to prevent cross-generation overwrites
+                        self.local_map = self.map_kernel(f_pos, f_rot.view(1), self.local_map, base_cart_scan, self.map_coords, self.sonar_mask, self.alpha, self.noise_decay_factor_tensor).clone()
             else:
                 self.local_map.copy_(base_cart_scan)
                 self.motion_model.last_time = frame.timestamp

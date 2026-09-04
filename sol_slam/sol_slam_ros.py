@@ -24,7 +24,7 @@ class SOLSLAMROSWrapper(Node):
         # 1. Base Node Parameters
         self.declare_parameter('enable_tensorrt', False)
         self.declare_parameter('odom_frame_id', 'odom')
-        self.declare_parameter('child_frame_id', 'base_link')
+        self.declare_parameter('child_frame_id', 'map')
         self.declare_parameter('enable_debug_viz', True)
         self.declare_parameter('contrast', 10.0)
 
