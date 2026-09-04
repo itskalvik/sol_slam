@@ -41,7 +41,7 @@ flowchart TD
     %% Nodes styled as the original translucent dashed containers
     DEV["<div style='min-width:320px;padding:4px 0;'><b>Forward-Looking Sonar</b><br/><span style='font-size:12px;color:#64748B;'>e.g., Sonoptix Echo</span></div>"]
     
-    NODE["<div style='min-width:380px;padding:4px 0;'><b>SonoptixEchoSLAMNode</b><hr style='border:0;border-top:1px solid #C599FF44;margin:8px 0;'/><div align='left' style='font-size:12px;line-height:1.6;'>• Parse range metadata & horizontal FOV (120° / 90°)<br/>• Optional polar unwarping to sonar beams<br/>• Construct <code>SonarFrame</code></div></div>"]
+    NODE["<div style='min-width:380px;padding:4px 0;'><b>SonoptixEchoSLAMNode</b><hr style='border:0;border-top:1px solid #C599FF44;margin:8px 0;'/><div align='left' style='font-size:12px;line-height:1.6;'>• Parse range metadata & horizontal FOV (120° / 90°)<br/>• Optional polar scan unwarping to sonar beams<br/>• Construct <code>SonarFrame</code></div></div>"]
     
     ALGO["<div style='min-width:380px;padding:4px 0;'><b>SOLSLAMCore</b><hr style='border:0;border-top:1px solid #C599FF44;margin:8px 0;'/><div align='left' style='font-size:12px;line-height:1.6;'>1. Polar speckle denoising<br/>2. Backward-lookup Cartesian grid projection <i>(Bilinear)</i><br/>3. Constant-velocity state prediction<br/>4. Map gradient & damped Hessian precomputation<br/>5. Iterative IC-GN scan alignment <i>(Gradient clipping)</i><br/>6. EMA map update & statistical noise pruning</div></div>"]
 
@@ -63,9 +63,9 @@ flowchart TD
     end
 
     %% Edge Labels styled as intermediate message badges
-    L_IMG["<code>sensor_msgs/Image</code><br/><span style='font-size:11px;color:#64748B;'>Raw Polar / Unwarped</span>"]
+    L_IMG["<code>sensor_msgs/Image</code><br/><span style='font-size:11px;color:#64748B;'>Raw: Polar / Unwarped</span>"]
     L_FRAME["<code>SonarFrame</code>"]
-    L_EST["<code>Pose & Grid Estimates</code>"]
+    L_EST["<code>Pose Estimates</code>"]
     L_ASYNC["<code>Async Queue</code>"]
 
     %% Pipeline Connections via Message Blocks
