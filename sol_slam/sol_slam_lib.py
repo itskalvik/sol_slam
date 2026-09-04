@@ -267,6 +267,10 @@ class SOLSLAM:
             self.local_map_blurred = torch.zeros_like(self.local_map)
             self.last_cart_scan = None
             
+            # Persistent gradient buffers
+            self.M_x_buf = torch.zeros_like(self.local_map)
+            self.M_y_buf = torch.zeros_like(self.local_map)
+            
             axis = (torch.arange(self.map_size, dtype=self.dtype, device=self.device) - self.map_size // 2) * self.map_res
             grid_y, grid_x = torch.meshgrid(axis, axis, indexing='ij')
             self.map_coords = torch.stack([grid_x, grid_y], dim=-1).to(self.device).contiguous()
@@ -325,17 +329,22 @@ class SOLSLAM:
         res = self.map_res
         M = self.local_map_blurred.detach()
         
-        M_x = torch.zeros_like(M, dtype=self.dtype, device=self.device)
-        M_y = torch.zeros_like(M, dtype=self.dtype, device=self.device)
-        M_x[:, 1:-1] = (M[:, 2:] - M[:, :-2]) / (2 * res)
-        M_y[1:-1, :] = (M[2:, :] - M[:-2, :]) / (2 * res)
+        # Zero out the persistent buffers in-place
+        self.M_x_buf.zero_()
+        self.M_y_buf.zero_()
+        
+        # Compute gradients in-place
+        self.M_x_buf[:, 1:-1] = (M[:, 2:] - M[:, :-2]) / (2 * res)
+        self.M_y_buf[1:-1, :] = (M[2:, :] - M[:-2, :]) / (2 * res)
         
         x_grid = self.map_coords[..., 0]
         y_grid = self.map_coords[..., 1]
-        M_theta = -y_grid * M_x + x_grid * M_y
+        
+        # Use the buffers for theta computation
+        M_theta = -y_grid * self.M_x_buf + x_grid * self.M_y_buf
 
-        M_x_valid = M_x.view(-1)[self.flat_indices]
-        M_y_valid = M_y.view(-1)[self.flat_indices]
+        M_x_valid = self.M_x_buf.view(-1)[self.flat_indices]
+        M_y_valid = self.M_y_buf.view(-1)[self.flat_indices]
         M_theta_valid = M_theta.view(-1)[self.flat_indices]
         
         J_flat = torch.stack([M_x_valid, M_y_valid, M_theta_valid]).to(self.device)
