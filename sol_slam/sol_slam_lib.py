@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import torchvision
 import rclpy
 from rclpy.node import Node
+import threading
 
 from std_msgs.msg import Header
 from sensor_msgs.msg import Image, PointCloud2, PointField
@@ -58,10 +59,6 @@ def unwarp_sonar(warped_image, fov=130, num_beams=768):
 # Solver & Map Update Modules
 # ==========================================
 class FullSolverKernel(nn.Module):
-    """
-    Computes all iterations and returns the state that achieved the lowest loss.
-    Guarantees mathematically stable alignment even if the solver diverges later.
-    """
     def __init__(self, map_res, map_size, iterations, lr, max_grad_norm, N_valid):
         super().__init__()
         self.map_res = float(map_res)
@@ -104,12 +101,10 @@ class FullSolverKernel(nn.Module):
             grad = -(J_flat @ warped_flat) / self.N_valid
             loss = -torch.dot(M_flat, warped_flat) / self.N_valid
             
-            # --- Trajectory Selection Logic ---
             is_better = loss < best_loss
             best_loss = torch.where(is_better, loss, best_loss)
             best_state = torch.where(is_better, state, best_state)
             
-            # --- Continue Optimization Path with Clamped Grad Norm ---
             grad_norm = torch.linalg.vector_norm(grad)
             grad_norm_safe = torch.clamp(grad_norm, min=1e-8)
             clip_factor = torch.clamp(self.max_grad_norm / grad_norm_safe, max=1.0)
@@ -267,7 +262,6 @@ class SOLSLAM:
             self.local_map_blurred = torch.zeros_like(self.local_map)
             self.last_cart_scan = None
             
-            # Persistent gradient buffers
             self.M_x_buf = torch.zeros_like(self.local_map)
             self.M_y_buf = torch.zeros_like(self.local_map)
             
@@ -291,7 +285,6 @@ class SOLSLAM:
             self.flat_indices = torch.nonzero(self.flat_mask).squeeze().to(torch.int64).contiguous()
             self.N_valid_tensor = torch.tensor([self.flat_mask.sum().item()], dtype=self.dtype, device=self.device)
             
-            # Precompute Cartesian projection grid
             if self.is_warped:
                 norm_y = 1.0 - 2.0 * (x_safe / self.max_range)
                 norm_x = -(y_safe / self.half_width_phys)
@@ -303,7 +296,6 @@ class SOLSLAM:
                 norm_r = (r_idx / (self.H_img - 1) * 2) - 1
                 self.cart_proj_grid = torch.stack([norm_a, norm_r], dim=-1).unsqueeze(0).to(self.device)
 
-            # Instantiate optimization and map modules
             self.solver_kernel = FullSolverKernel(
                 self.map_res, self.map_size, self.iterations, self.lr, 
                 self.max_grad_norm, self.N_valid_tensor.item()
@@ -329,18 +321,15 @@ class SOLSLAM:
         res = self.map_res
         M = self.local_map_blurred.detach()
         
-        # Zero out the persistent buffers in-place
         self.M_x_buf.zero_()
         self.M_y_buf.zero_()
         
-        # Compute gradients in-place
         self.M_x_buf[:, 1:-1] = (M[:, 2:] - M[:, :-2]) / (2 * res)
         self.M_y_buf[1:-1, :] = (M[2:, :] - M[:-2, :]) / (2 * res)
         
         x_grid = self.map_coords[..., 0]
         y_grid = self.map_coords[..., 1]
         
-        # Use the buffers for theta computation
         M_theta = -y_grid * self.M_x_buf + x_grid * self.M_y_buf
 
         M_x_valid = self.M_x_buf.view(-1)[self.flat_indices]
@@ -449,7 +438,6 @@ class SOLSLAMBaseNode(Node):
         self.declare_parameter('solver.lm_damping', 1e-3)
         self.declare_parameter('solver.bound_factor', 1.75)
         
-        # Kept for launch parameter backward compatibility
         self.declare_parameter('solver.grad_tol', 1e-6)
         self.declare_parameter('solver.loss_tol', 1e-9)
 
@@ -462,11 +450,20 @@ class SOLSLAMBaseNode(Node):
         self.odom_pub = self.create_publisher(Odometry, self.get_parameter('topic_out').value, 10)
         self.path_pub = self.create_publisher(Path, self.get_parameter('path_topic').value, 10)
         
+        # Async setup
+        self.viz_lock = threading.Lock()
+        self.viz_event = threading.Event()
+        self.latest_viz_data = None
+        
         if self.enable_debug_viz:
             self.peaks_pub = self.create_publisher(PointCloud2, self.get_parameter('peaks_topic').value, 10)
             self.scan_img_pub = self.create_publisher(Image, self.get_parameter('scan_img_topic').value, 10)
             self.map_img_pub = self.create_publisher(Image, self.get_parameter('map_img_topic').value, 10)
             self.bridge = CvBridge()
+            
+            # Start background publisher thread
+            self.viz_thread = threading.Thread(target=self.viz_worker_loop, daemon=True)
+            self.viz_thread.start()
 
         self.path_msg = Path()
         self.path_msg.header.frame_id = self.odom_frame_id
@@ -561,16 +558,37 @@ class SOLSLAMBaseNode(Node):
 
         self.publish_odometry(stamp, pos_x, pos_y, rot_theta, vx, vy, vth)
         
+        # Async Publisher Handoff
         if self.enable_debug_viz:
-            self.publish_debug_images(stamp)
-            self.publish_peaks(stamp)
+            map_clone = self.estimator.local_map.detach().clone()
+            scan_clone = self.estimator.last_cart_scan.detach().clone()
+            
+            with self.viz_lock:
+                self.latest_viz_data = (stamp, map_clone, scan_clone)
+            self.viz_event.set()
 
-    def publish_peaks(self, stamp):
-        if not hasattr(self.estimator, 'local_map') or self.estimator.local_map is None:
-            return
+    def viz_worker_loop(self):
+        while rclpy.ok():
+            self.viz_event.wait(timeout=0.1)
+            if not self.viz_event.is_set():
+                continue
+                
+            self.viz_event.clear()
+            
+            with self.viz_lock:
+                if self.latest_viz_data is None:
+                    continue
+                stamp, map_tensor, scan_tensor = self.latest_viz_data
+                self.latest_viz_data = None 
+                
+            try:
+                self.publish_debug_images(stamp, map_tensor, scan_tensor)
+                self.publish_peaks(stamp, map_tensor)
+            except Exception as e:
+                self.get_logger().error(f"Async Viz Error: {e}")
 
+    def publish_peaks(self, stamp, map_tensor):
         try:
-            map_tensor = self.estimator.local_map
             threshold = self.get_parameter('mapping.min_intensity_threshold').value
             
             mask = map_tensor > threshold
@@ -623,12 +641,9 @@ class SOLSLAMBaseNode(Node):
         except Exception as e:
             self.get_logger().error(f"Failed to publish local map point cloud: {e}")
 
-    def publish_debug_images(self, stamp):
-        if not hasattr(self.estimator, 'local_map') or getattr(self.estimator, 'last_cart_scan', None) is None:
-            return
-
+    def publish_debug_images(self, stamp, map_tensor, scan_tensor):
         try:
-            map_array = self.estimator.local_map.detach().cpu().numpy()
+            map_array = map_tensor.cpu().numpy()
             map_array = np.clip(map_array * self.contrast, 0, 1)
             map_array = cv2.rotate(map_array, cv2.ROTATE_90_COUNTERCLOCKWISE)
             map_array = cv2.flip(map_array, 1)
@@ -640,7 +655,7 @@ class SOLSLAMBaseNode(Node):
             map_img_msg.header.frame_id = self.odom_frame_id
             self.map_img_pub.publish(map_img_msg)
 
-            scan_array = self.estimator.last_cart_scan.detach().cpu().numpy()
+            scan_array = scan_tensor.cpu().numpy()
             scan_array = scan_array[:, int(scan_array.shape[0]/2):]
             scan_array = np.clip(scan_array * self.contrast, 0, 1)
             scan_array = cv2.rotate(scan_array, cv2.ROTATE_90_COUNTERCLOCKWISE)
