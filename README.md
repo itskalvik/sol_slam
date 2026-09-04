@@ -24,31 +24,65 @@ A lightweight, GPU-accelerated ROS 2 package for real-time 2D Sonar-Only Local S
 
 ## System Architecture
 
-```
-[ Forward-Looking Sonar (e.g., Sonoptix Echo) ]
-                     │  sensor_msgs/Image (Raw Polar / Unwarped)
-                     ▼
-       [ SonoptixEchoSLAMNode ]
-                     │  - Parse range metadata & horizontal FOV (120° / 90°)
-                     │  - Optional polar unwarping to sonar beams
-                     │  - Construct SonarFrame
-                     ▼
-          [ SOLSLAMCore ]
-                     │  - Polar speckle denoising
-                     │  - Backward-lookup Cartesian grid projection (Bilinear)
-                     │  - Predictive state initialization from constant-velocity model
-                     │  - Precompute map gradients and damped Hessian
-                     │  - Iterative IC-GN scan alignment with gradient clipping
-                     │  - EMA map update & statistical noise decay pruning
-                     ▼
-        [ SOLSLAMROSWrapper ]
-         ├── Odometry & TF (/sol_slam/odom, odom -> map)
-         ├── Accumulated Path (/sol_slam/path)
-         └── Async Visualization Worker (optional)
-                 ├── Extracted Map Peaks (/sol_slam/peaks) [sensor_msgs/PointCloud2]
-                 ├── Dynamic Local Map (/sol_slam/map) [sensor_msgs/Image]
-                 └── Cartesian Scan (/sol_slam/denoised_scan) [sensor_msgs/Image]
+```mermaid
 
+%%{init: {
+  'theme': 'base',
+  'themeVariables': {
+    'fontFamily': 'Inter, system-ui, -apple-system, sans-serif',
+    'fontSize': '13px',
+    'lineColor': '#C599FF',
+    'textColor': '#1E293B',
+    'edgeLabelBackground': '#FFFFFF10'
+  }
+}}%%
+
+flowchart TD
+    %% Nodes styled as the original translucent dashed containers
+    DEV["<div style='min-width:320px;padding:4px 0;'><b>Forward-Looking Sonar</b><br/><span style='font-size:12px;color:#64748B;'>e.g., Sonoptix Echo</span></div>"]
+    
+    NODE["<div style='min-width:380px;padding:4px 0;'><b>SonoptixEchoSLAMNode</b><hr style='border:0;border-top:1px solid #C599FF44;margin:8px 0;'/><div align='left' style='font-size:12px;line-height:1.6;'>• Parse range metadata & horizontal FOV (120° / 90°)<br/>• Optional polar unwarping to sonar beams<br/>• Construct <code>SonarFrame</code></div></div>"]
+    
+    ALGO["<div style='min-width:380px;padding:4px 0;'><b>SOLSLAMCore</b><hr style='border:0;border-top:1px solid #C599FF44;margin:8px 0;'/><div align='left' style='font-size:12px;line-height:1.6;'>1. Polar speckle denoising<br/>2. Backward-lookup Cartesian grid projection <i>(Bilinear)</i><br/>3. Constant-velocity state prediction<br/>4. Map gradient & damped Hessian precomputation<br/>5. Iterative IC-GN scan alignment <i>(Gradient clipping)</i><br/>6. EMA map update & statistical noise pruning</div></div>"]
+
+    subgraph WRAPPER["&nbsp;&nbsp;&nbsp;&nbsp;<b>SOLSLAMROSWrapper</b>&nbsp;&nbsp;&nbsp;&nbsp;"]
+        direction TB
+
+        subgraph STATE["State Estimation"]
+            direction LR
+            ODOM["<div style='min-width:200px;'><b>/sol_slam/odom</b><br/><span style='font-size:11px;color:#64748B;'>TF: odom &rarr; map</span></div>"]
+            PATH["<div style='min-width:200px;'><b>/sol_slam/path</b><br/><span style='font-size:11px;color:#64748B;'>nav_msgs/Path</span></div>"]
+        end
+
+        subgraph VIZ["Async Visualization Worker"]
+            direction LR
+            PEAKS["<div style='min-width:180px;'><b>/sol_slam/peaks</b><br/><span style='font-size:11px;color:#64748B;'>sensor_msgs/PointCloud2</span></div>"]
+            MAP["<div style='min-width:180px;'><b>/sol_slam/map</b><br/><span style='font-size:11px;color:#64748B;'>sensor_msgs/Image</span></div>"]
+            SCAN["<div style='min-width:180px;'><b>/sol_slam/denoised_scan</b><br/><span style='font-size:11px;color:#64748B;'>sensor_msgs/Image</span></div>"]
+        end
+    end
+
+    %% Edge Labels styled as intermediate message badges
+    L_IMG["<code>sensor_msgs/Image</code><br/><span style='font-size:11px;color:#64748B;'>Raw Polar / Unwarped</span>"]
+    L_FRAME["<code>SonarFrame</code>"]
+    L_EST["<code>Pose & Grid Estimates</code>"]
+    L_ASYNC["<code>Async Queue</code>"]
+
+    %% Pipeline Connections via Message Blocks
+    DEV --> L_IMG --> NODE
+    NODE --> L_FRAME --> ALGO
+    ALGO --> L_EST --> STATE
+    ALGO -.-> L_ASYNC -.-> VIZ
+
+    %% Original translucent dashed wrapper aesthetic applied across nodes
+    classDef dashedContainer fill:#FFFFFF10,stroke:#C599FF,stroke-width:1.5px,stroke-dasharray:4 4,rx:14px,color:#1E293B;
+    classDef msgBadge fill:#FFFFFF10,stroke:#C599FF,stroke-width:1px,stroke-dasharray:2 2,rx:6px,color:#334155;
+    classDef subContainer fill:#FFFFFF08,stroke:#C599FF,stroke-width:1px,rx:10px;
+
+    %% Class Assignments
+    class DEV,NODE,ALGO,ODOM,PATH,PEAKS,MAP,SCAN,WRAPPER dashedContainer;
+    class L_IMG,L_FRAME,L_EST,L_ASYNC msgBadge;
+    class STATE,VIZ subContainer;
 ```
 
 ---
