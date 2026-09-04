@@ -2,6 +2,8 @@
 
 A lightweight, GPU-accelerated ROS 2 package for real-time 2D Sonar-Only Local SLAM using standalone Forward-Looking Sonar (FLS) data. Instead of relying on sparse keypoints or auxiliary sensors (DVL/IMU), SOL-SLAM directly registers full acoustic intensity scans against a recursively updated local map using an Inverse Compositional Gauss-Newton (IC-GN) formulation.
 
+![SOL-SLAM](.assets/SOL-SLAM.webp)
+
 ---
 
 ## Features
