@@ -177,7 +177,7 @@ ros2 service call /sonoptix_echo_slam/reset_odometry std_srvs/srv/Trigger
 | `unwarp_image` | bool | `false` | Unwarps polar-transformed sonar inputs using OpenCV `warpPolar`. |
 | `enable_tensorrt` | bool | `false` | Compiles solver and map update kernels into TensorRT execution graphs. |
 
-### SOL-SLAM Registration Parameters (`SOLSLAMConfig`)
+### SOL-SLAM Registration Parameters
 
 Parameters map directly to the formulations detailed in the paper:
 
