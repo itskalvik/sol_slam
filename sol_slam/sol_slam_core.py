@@ -28,7 +28,7 @@ class SOLSLAMConfig:
     denoise_factor: float = 2.5
     min_intensity_threshold: float = 0.0008
     min_valid_fraction: float = 0.006
-    iterations: int = 15
+    iterations: int = 25
     lr: float = 1.0
     max_grad_norm: float = 10.0
     lm_damping: float = 1e-3

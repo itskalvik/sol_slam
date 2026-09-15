@@ -156,6 +156,7 @@ class SOLSLAMROSWrapper(Node):
         pose_stamped.pose = odom.pose.pose
         self.path_msg.header = odom.header
         self.path_msg.poses.append(pose_stamped)
+        self.path_msg.poses = self.path_msg.poses[-500:]
         self.path_pub.publish(self.path_msg)
 
     def publish_peaks(self, stamp, map_tensor):
