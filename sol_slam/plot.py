@@ -2,10 +2,12 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 import matplotlib.lines as mlines
+from matplotlib.offsetbox import AnchoredText
 
 def plot_aligned_trajectories(csv_file='../../bags/09-03-27.csv', start_index=0, end_index=None):
     """
-    Plots the aligned trajectories of Sonar Odometry and DVL.
+    Plots the aligned trajectories of Sonar Odometry and DVL and overlays 
+    the mean translation and rotation errors in a text box.
     
     Parameters:
     - csv_file: Path to the CSV file containing the data.
@@ -56,7 +58,23 @@ def plot_aligned_trajectories(csv_file='../../bags/09-03-27.csv', start_index=0,
     dvl_x_aligned = dvl_x_rotated + odom_x[0]
     dvl_y_aligned = dvl_y_rotated + odom_y[0]
 
-    # 4. Setup the Plot to match Aracati style, with a light theme & dark plot area
+    # Step E: Align DVL yaw heading to match initial Odom yaw
+    dvl_yaw_aligned = dvl_yaw + yaw_diff
+
+    # 4. Compute the mean translation and rotation errors
+    trans_error_2d = np.sqrt((odom_x - dvl_x_aligned)**2 + (odom_y - dvl_y_aligned)**2)
+    mean_trans_error = np.mean(trans_error_2d)
+
+    error_yaw = np.arctan2(np.sin(odom_yaw - dvl_yaw_aligned), 
+                           np.cos(odom_yaw - dvl_yaw_aligned))
+    mean_rot_error_rad = np.mean(np.abs(error_yaw))
+    mean_rot_error_deg = np.rad2deg(mean_rot_error_rad)
+
+    # Print to console as well
+    print(f"Mean Translation Error: {mean_trans_error:.4f} m")
+    print(f"Mean Rotation Error   : {mean_rot_error_rad:.4f} rad ({mean_rot_error_deg:.2f}°)")
+
+    # 5. Setup the Plot
     fig, ax = plt.subplots(figsize=(7, 5))
     
     # Set light figure background and slightly dark axes background for contrast
@@ -79,7 +97,7 @@ def plot_aligned_trajectories(csv_file='../../bags/09-03-27.csv', start_index=0,
     ax.scatter(dvl_x_aligned[-1], dvl_y_aligned[-1], color='#FF3333', marker='X', 
                s=80, edgecolor='black', zorder=5)
 
-    # Formatting the plot axes (Light Theme defaults)
+    # Formatting the plot axes
     ax.set_xlabel('X (meters)', fontsize=12, color='black')
     ax.set_ylabel('Y (meters)', fontsize=12, color='black')
     ax.tick_params(axis='x', colors='black')
@@ -87,7 +105,7 @@ def plot_aligned_trajectories(csv_file='../../bags/09-03-27.csv', start_index=0,
     for spine in ax.spines.values():
         spine.set_edgecolor('black')
 
-    # Custom main legend handles to include start and end point definitions
+    # Custom main legend handles
     handles, labels = ax.get_legend_handles_labels()
     start_marker = mlines.Line2D([], [], color='w', marker='o', linestyle='None', 
                                  markersize=10, markeredgecolor='black', label='Start Point')
@@ -103,19 +121,45 @@ def plot_aligned_trajectories(csv_file='../../bags/09-03-27.csv', start_index=0,
     for text in legend.get_texts():
         text.set_color("black")
 
+    # 6. Add Formatted Error Text Box (Styled based on plot_aracati.py)
+    error_text = (
+        "RMSE vs DVL\n"
+        "─────────────────\n"
+        f"Translation:   {mean_trans_error:.2f} m\n"
+        f"Rotation:     {mean_rot_error_deg:.2f}°"
+    )
+    
+    anchored_text = AnchoredText(
+        error_text, 
+        loc='lower right',
+        borderpad=0.93,
+        prop=dict(fontsize=11, multialignment='left'),
+        frameon=True
+    )
+    
+    # Match the legend box styling exactly
+    anchored_text.patch.set_boxstyle("round,pad=0.4")
+    anchored_text.patch.set_facecolor("white")
+    anchored_text.patch.set_edgecolor("#cccccc")
+    anchored_text.patch.set_linewidth(1.0)
+    anchored_text.patch.set_alpha(1.0)
+    anchored_text.set_zorder(10)
+    
+    ax.add_artist(anchored_text)
+
     # Grid and layout
     ax.grid(True, linestyle=':', alpha=0.4, color="#ffffff")
     ax.axis('equal') # Ensure 1 meter in X looks the same as 1 meter in Y
     plt.tight_layout()
-    #plt.savefig('seq_3.pdf', bbox_inches='tight')  # Save the figure with high resolution
 
     # Display the plot
+    plt.savefig(f"seq_3.pdf", dpi=300, bbox_inches='tight')
     plt.show()
 
 if __name__ == '__main__':
     #plot_aligned_trajectories(start_index=100, end_index=350)
     #plot_aligned_trajectories(start_index=350, end_index=550)
-    #plot_aligned_trajectories(start_index=700, end_index=900)
+    plot_aligned_trajectories(start_index=700, end_index=900)
 
     '''
     13_14-42-05
